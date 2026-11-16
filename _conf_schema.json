@@ -1,0 +1,98 @@
+{
+  "enabled": {
+    "description": "启用直播主持插件",
+    "type": "bool",
+    "default": true
+  },
+  "session_targets": {
+    "description": "Personal Runtime 目标会话 UMO 列表；留空时使用 AstrBot 已配置的目标",
+    "type": "list",
+    "default": []
+  },
+  "stream_input_platform_id": {
+    "description": "主动话题使用的 AG99live Stream 输入适配器实例 ID",
+    "type": "string",
+    "default": "ag99live_stream"
+  },
+  "topic_interval_seconds": {
+    "description": "无新输入时提交一次主动话题机会的间隔（秒）",
+    "type": "int",
+    "default": 300,
+    "slider": {
+      "min": 60,
+      "max": 86400,
+      "step": 30
+    }
+  },
+  "danmaku_enabled": {
+    "description": "处理 AG99live 前端提交的 B 站弹幕批次",
+    "type": "bool",
+    "default": true
+  },
+  "bilibili_live_enabled": {
+    "description": "由本插件直接连接 B 站直播间并接收弹幕",
+    "type": "bool",
+    "default": false
+  },
+  "bilibili_live_room_id": {
+    "description": "B 站直播间号；只接受数字房间号",
+    "type": "string",
+    "default": ""
+  },
+  "bilibili_live_cookie": {
+    "description": "可选的 B 站 SESSDATA；不填写时仍可接收弹幕，但观众身份可能脱敏",
+    "type": "string",
+    "default": "",
+    "secret": true
+  },
+  "bilibili_live_response_interval": {
+    "description": "弹幕批量提交到 Personal Runtime 的最短间隔（秒）",
+    "type": "int",
+    "default": 30,
+    "slider": {
+      "min": 5,
+      "max": 600,
+      "step": 1
+    }
+  },
+  "bilibili_live_max_batch_size": {
+    "description": "一次送入策略链的最多弹幕/进入事件数",
+    "type": "int",
+    "default": 8,
+    "slider": {
+      "min": 1,
+      "max": 32,
+      "step": 1
+    }
+  },
+  "bilibili_live_max_queue_size": {
+    "description": "B 站事件缓冲队列上限",
+    "type": "int",
+    "default": 80,
+    "slider": {
+      "min": 16,
+      "max": 2048,
+      "step": 16
+    }
+  },
+  "welcome_new_viewers": {
+    "description": "检测到新观众时，在本轮弹幕回复中提示自然欢迎",
+    "type": "bool",
+    "default": true
+  },
+  "motion_feedback_enabled": {
+    "description": "允许用户用单独的 + 或 - 评价最近一次角色动作",
+    "type": "bool",
+    "default": true
+  },
+  "max_viewer_state": {
+    "description": "最多保留的新观众标识数量",
+    "type": "int",
+    "default": 2000,
+    "slider": {
+      "min": 100,
+      "max": 20000,
+      "step": 100
+    }
+  }
+}
