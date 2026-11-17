@@ -344,13 +344,13 @@ class AG99liveStreamHostPlugin(Star):
 
     async def _submit_live_message(
         self, session: str, item: Mapping[str, object]
-    ) -> None:
+    ) -> bool:
         if not session:
-            return
+            raise ValueError("live_input_target_required")
         platform = self._stream_input_adapter()
         if platform is None:
             raise RuntimeError("ag99live_stream_input_adapter_unavailable")
-        await platform.submit_live_item(item)
+        return await platform.submit_live_item(item)
 
     def _can_accept_live_input(self) -> bool:
         platform = self._stream_input_adapter()

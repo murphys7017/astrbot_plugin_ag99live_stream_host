@@ -121,13 +121,13 @@ class AG99liveStreamInputPlatform(Platform):
         del session, message_chain
         logger.debug("AG99live Stream Input is input-only; output uses OLV.")
 
-    async def submit_live_item(self, item: Mapping[str, object]) -> None:
+    async def submit_live_item(self, item: Mapping[str, object]) -> bool:
         """Commit a plugin-generated live event through this input adapter."""
         if item.get("kind") == "live_topic":
             raise ValueError("live_topic must use the Runtime Observation sensor")
         if self._runtime is not None and self._runtime.is_processing:
-            return
-        await self._commit_live_message(self.presentation_session_id, item)
+            return False
+        return await self._commit_live_message(self.presentation_session_id, item)
 
     def is_busy(self) -> bool:
         adapter = _resolve_olv_adapter(self.presentation_platform_id)
@@ -155,18 +155,18 @@ class AG99liveStreamInputPlatform(Platform):
 
     async def _commit_live_message(
         self, _session: str, item: Mapping[str, object]
-    ) -> None:
+    ) -> bool:
         payload = item.get("payload")
         if not isinstance(payload, Mapping):
-            return
+            raise ValueError("live_input_payload_required")
         kind = str(item.get("kind") or "live_danmaku").strip()
         excerpt = str(payload.get("ambient_message_excerpt") or "").strip()
         if not excerpt:
-            return
+            raise ValueError("live_input_excerpt_required")
         if kind != "live_topic":
             self.last_viewer_activity_at = time.monotonic()
         if self.is_busy():
-            return
+            return False
         event_text = _format_live_message(kind, payload)
         message_id = str(payload.get("batch_id") or uuid4().hex)
         message = AstrBotMessage()
@@ -181,8 +181,8 @@ class AG99liveStreamInputPlatform(Platform):
         first_uid = (
             str(ids[0]).strip()
             if isinstance(ids, (list, tuple)) and ids
-            else "live-viewer"
-        )
+            else ""
+        ) or "live-viewer"
         message.sender = MessageMember(user_id=first_uid, nickname=first_name)
         message.self_id = self.platform_id
         message.session_id = self.presentation_session_id
@@ -237,6 +237,7 @@ class AG99liveStreamInputPlatform(Platform):
                 success,
                 reason,
             )
+            return True
         except (TimeoutError, asyncio.CancelledError):
             if delivery_turn_id:
                 await olv_adapter.turn_coordinator.abort_turn_from_backend(
@@ -265,7 +266,6 @@ def _format_live_message(kind: str, payload: Mapping[str, object]) -> str:
         else ""
     )
     requirement = {
-        "live_gift": "这是礼物事件，请自然表达感谢并结合角色动作表现，不要虚构礼物金额。",
         "live_advanced_chat": "这是高优先级直播留言，请优先理解并自然回应，不要逐字复述内部标签。",
         "live_viewer_entered": "这是进入直播间事件；如果适合欢迎新观众，请简短自然地欢迎。",
         "live_topic": "这是主动话题机会，请结合近期上下文自然表达，允许保持安静。",
@@ -273,13 +273,19 @@ def _format_live_message(kind: str, payload: Mapping[str, object]) -> str:
         kind,
         "这是普通直播消息，请选择有价值的内容简短回应，不要机械复读。",
     )
+    if kind == "live_gift":
+        requirement = (
+            "回复开头先在实际说出的台词中感谢【礼物】行里的送礼者，点名并提到礼物。"
+            "多人或多份礼物可以合并感谢，不要编造金额或数量。感谢后优先回应【醒目留言】，"
+            "再视情况回应普通弹幕。"
+        )
     return "\n".join(
         (
             "[AG99live 直播消息]",
             f"事件类型：{kind}",
             f"参与用户：{participant_text or '未知'}",
-            f"事件内容：{excerpt}",
             f"处理要求：{requirement}",
+            f"事件内容：\n{excerpt}",
         )
     )
 

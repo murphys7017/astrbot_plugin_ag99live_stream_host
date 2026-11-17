@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import http.cookies
 import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from math import log2
+from random import random, sample
 from typing import Awaitable, Callable, Mapping
 from uuid import uuid4
 
@@ -22,8 +25,12 @@ except ImportError:  # pragma: no cover - exercised by the optional dependency c
 
 
 TargetResolver = Callable[[], tuple[str, ...]]
-ObservationSubmitter = Callable[[str, Mapping[str, object]], Awaitable[None]]
+# False means admission was busy and no event was committed.
+ObservationSubmitter = Callable[[str, Mapping[str, object]], Awaitable[bool]]
 ViewerRecorder = Callable[[str, str], Awaitable[bool]]
+_GIFT_MAX_AGE_SECONDS = 300
+_BUSY_RECHECK_SECONDS = 0.25
+_CONTRIBUTOR_LIMIT = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +41,7 @@ class LiveInput:
     text: str = ""
     received_at: float = field(default_factory=time.time)
     received_monotonic: float = field(default_factory=time.monotonic)
+    fan_level: int = 0
 
 
 class BilibiliLiveRuntime:
@@ -54,9 +62,10 @@ class BilibiliLiveRuntime:
         self.room_id = int(room_id)
         self.cookie = cookie.strip()
         self.max_batch_size = max(1, min(int(max_batch_size), 32))
-        self._queue: asyncio.Queue[LiveInput] = asyncio.Queue(
-            maxsize=max(16, min(int(max_queue_size), 2048))
-        )
+        self._queue_limit = max(16, min(int(max_queue_size), 2048))
+        self._pending: deque[LiveInput] = deque()
+        self._input_ready = asyncio.Event()
+        self._contributions: OrderedDict[str, int] = OrderedDict()
         self._target_resolver = target_resolver
         self._submit_observation = submit_observation
         self._record_viewer = record_viewer
@@ -109,14 +118,20 @@ class BilibiliLiveRuntime:
         session, self._session = self._session, None
         if session is not None and not session.closed:
             await session.close()
+        self._pending.clear()
+        self._input_ready.clear()
+        self._contributions.clear()
 
-    def enqueue_danmaku(self, name: str, uid: int, text: str) -> None:
+    def enqueue_danmaku(
+        self, name: str, uid: int, text: str, *, fan_level: int = 0
+    ) -> None:
         self._enqueue(
             LiveInput(
                 kind="live_danmaku",
                 name=_clean_text(name, 80) or "观众",
                 uid=str(uid or "").strip(),
                 text=_clean_text(text, 220),
+                fan_level=fan_level,
             )
         )
 
@@ -129,7 +144,10 @@ class BilibiliLiveRuntime:
             )
         )
 
-    def enqueue_gift(self, name: str, uid: int, text: str) -> None:
+    def enqueue_gift(
+        self, name: str, uid: int, text: str, *, paid_coins: int = 0
+    ) -> None:
+        self._record_contribution(uid, paid_coins)
         self._enqueue(
             LiveInput(
                 kind="live_gift",
@@ -139,7 +157,10 @@ class BilibiliLiveRuntime:
             )
         )
 
-    def enqueue_advanced_chat(self, name: str, uid: int, text: str) -> None:
+    def enqueue_advanced_chat(
+        self, name: str, uid: int, text: str, *, paid_coins: int = 0
+    ) -> None:
+        self._record_contribution(uid, paid_coins)
         self._enqueue(
             LiveInput(
                 kind="live_advanced_chat",
@@ -149,48 +170,83 @@ class BilibiliLiveRuntime:
             )
         )
 
+    def _record_contribution(self, uid: int, paid_coins: int) -> None:
+        if self._closed or not uid or paid_coins <= 0:
+            return
+        key = str(uid).strip()
+        self._contributions[key] = self._contributions.get(key, 0) + paid_coins
+        self._contributions.move_to_end(key)
+        if len(self._contributions) > _CONTRIBUTOR_LIMIT:
+            self._contributions.popitem(last=False)
+
     def _enqueue(self, item: LiveInput) -> None:
-        if self._closed or not item.name:
+        if self._closed or (item.kind != "live_viewer_entered" and not item.text):
             return
         self.last_received_at = time.monotonic()
-        if self._processing or not self._can_accept_input():
+        gift = item.kind == "live_gift"
+        if not gift and (self._processing or not self._can_accept_input()):
             self._dropped_while_busy += 1
             return
-        try:
-            self._queue.put_nowait(item)
-        except asyncio.QueueFull:
-            try:
-                self._queue.get_nowait()
-                self._queue.put_nowait(item)
-            except asyncio.QueueEmpty:
+        if len(self._pending) >= self._queue_limit:
+            expendable = next(
+                (pending for pending in self._pending if pending.kind != "live_gift"),
+                None,
+            )
+            if expendable is not None:
+                self._pending.remove(expendable)
+            elif not gift:
                 return
-            except asyncio.QueueFull:
-                logger.warning("AG99live Bilibili input queue is full; event dropped")
+            else:
+                self._pending.popleft()
+                logger.warning(
+                    "AG99live Bilibili gift queue is full; oldest gift dropped room=%s",
+                    self.room_id,
+                )
+        self._pending.append(item)
+        self._input_ready.set()
         logger.debug(
             "DIAG live_input.received room=%s kind=%s received_at=%.3f queue_size=%s",
             self.room_id,
             item.kind,
             item.received_at,
-            self._queue.qsize(),
+            len(self._pending),
         )
 
     async def _flush_loop(self) -> None:
         while True:
-            first = await self._queue.get()
+            await self._input_ready.wait()
+            self._discard_expired_gifts()
+            if not self._can_accept_input():
+                # External playback has no receipt owned by this runtime. Only
+                # pending gifts need to check when that playback becomes idle.
+                self._pending = deque(
+                    item for item in self._pending if item.kind == "live_gift"
+                )
+                if self._pending:
+                    await asyncio.sleep(_BUSY_RECHECK_SECONDS)
+                    continue
+            if not self._pending:
+                self._input_ready.clear()
+                continue
+            batch = self._select_batch(list(self._pending))
+            selected_gifts = {id(item) for item in batch if item.kind == "live_gift"}
+            self._pending = deque(
+                item
+                for item in self._pending
+                if item.kind == "live_gift" and id(item) not in selected_gifts
+            )
             self._processing = True
-            batch = [first]
             try:
-                # Take only the already-arrived burst. Never wait to fill it,
-                # and never replay unselected or busy-period input afterward.
-                while not self._queue.empty():
-                    item = self._queue.get_nowait()
-                    if len(batch) < self.max_batch_size:
-                        batch.append(item)
-                if self._can_accept_input():
-                    await self._flush_batch(batch)
+                if not await self._flush_batch(batch):
+                    # Admission may become busy while recording viewers. No
+                    # committed event is replayed, and ordinary chat stays dropped.
+                    retry = [item for item in batch if item.kind == "live_gift"]
+                    if retry:
+                        self._pending.extendleft(reversed(retry))
+                        while len(self._pending) > self._queue_limit:
+                            self._pending.popleft()
+                        await asyncio.sleep(_BUSY_RECHECK_SECONDS)
             finally:
-                while not self._queue.empty():
-                    self._queue.get_nowait()
                 logger.info(
                     "DIAG live_input.ready room=%s dropped_while_busy=%s",
                     self.room_id,
@@ -199,53 +255,107 @@ class BilibiliLiveRuntime:
                 self._dropped_while_busy = 0
                 self._processing = False
 
+    def _discard_expired_gifts(self) -> None:
+        oldest = time.monotonic() - _GIFT_MAX_AGE_SECONDS
+        self._pending = deque(
+            item
+            for item in self._pending
+            if item.kind != "live_gift" or item.received_monotonic >= oldest
+        )
+
+    def _select_batch(self, burst: list[LiveInput]) -> list[LiveInput]:
+        gifts = [item for item in burst if item.kind == "live_gift"]
+        advanced = [item for item in burst if item.kind == "live_advanced_chat"]
+        selected = (gifts + advanced)[: self.max_batch_size]
+        slots = self.max_batch_size - len(selected)
+        if not slots:
+            return selected
+
+        # One ordinary candidate per viewer prevents repeated posts filling a batch.
+        chats = {
+            item.uid or f"name:{item.name.casefold()}": item
+            for item in burst
+            if item.kind == "live_danmaku"
+        }
+        candidates = list(chats.values())
+        if len(candidates) > slots:
+            random_slots = max(1, slots // 4) if slots > 1 else int(random() < 0.25)
+            candidates.sort(key=self._chat_priority, reverse=True)
+            ranked = slots - random_slots
+            candidates = candidates[:ranked] + sample(candidates[ranked:], random_slots)
+        selected.extend(candidates)
+        remaining = self.max_batch_size - len(selected)
+        if remaining:
+            selected.extend(
+                [item for item in burst if item.kind == "live_viewer_entered"][
+                    :remaining
+                ]
+            )
+        return selected
+
+    def _chat_priority(self, item: LiveInput) -> float:
+        paid_coins = self._contributions.get(item.uid, 0)
+        # Diminishing returns let both fan level and contribution affect selection.
+        return min(item.fan_level, 50) + 4 * log2(1 + paid_coins / 1000)
+
     @property
     def is_processing(self) -> bool:
         return self._processing
 
-    async def _flush_batch(self, batch: list[LiveInput]) -> None:
+    @property
+    def has_pending_input(self) -> bool:
+        return self._processing or bool(self._pending)
+
+    async def _flush_batch(self, batch: list[LiveInput]) -> bool:
         batch_id = uuid4().hex
         started_at = time.monotonic()
         oldest_received = min(item.received_monotonic for item in batch)
         excerpts: list[str] = []
-        names: list[str] = []
-        ids: list[str] = []
-        new_names: list[str] = []
-        new_ids: list[str] = []
+        participants: dict[tuple[str, str], None] = {}
+        new_viewers: dict[tuple[str, str], None] = {}
         kinds: set[str] = set()
         for item in batch:
-            is_new = await self._record_viewer(item.name, item.uid)
+            try:
+                is_new = await self._record_viewer(item.name, item.uid)
+            except OSError:
+                logger.exception(
+                    "Unable to save Bilibili viewer state room=%s", self.room_id
+                )
+                is_new = False
             prefix = "新观众 " if is_new else ""
             if is_new:
-                new_names.append(item.name)
-                new_ids.append(item.uid)
+                new_viewers[item.name, item.uid] = None
             if item.kind == "live_viewer_entered":
                 excerpts.append(f"{prefix}{item.name} 进入了直播间。")
+            elif item.kind == "live_gift":
+                excerpts.append(f"【礼物】{item.name}：{item.text}")
+            elif item.kind == "live_advanced_chat":
+                excerpts.append(f"【醒目留言】{item.name}：{item.text}")
             elif item.text:
-                excerpts.append(f"{prefix}{item.name}：{item.text}")
-            names.append(item.name)
-            if item.uid:
-                ids.append(item.uid)
+                excerpts.append(f"{prefix}{item.name}：{item.text[:120]}")
+            participants[item.name, item.uid] = None
             kinds.add(item.kind)
-        excerpt = "\n".join(excerpts).strip()[:256]
+        excerpt = "\n".join(excerpts).strip()
         if not excerpt:
-            return
+            return True
+        viewers = list(participants)[:16]
+        newcomers = list(new_viewers)[:16]
         payload = {
             "batch_id": batch_id,
             "live_input_received_at": min(item.received_at for item in batch),
             "ambient_message_excerpt": excerpt,
-            "participant_names": tuple(dict.fromkeys(names))[:16],
-            "participant_ids": tuple(dict.fromkeys(ids))[:16],
-            "new_viewer_names": tuple(dict.fromkeys(new_names))[:16],
-            "new_viewer_ids": tuple(new_ids)[:16],
+            "participant_names": tuple(name for name, _ in viewers),
+            "participant_ids": tuple(uid for _, uid in viewers),
+            "new_viewer_names": tuple(name for name, _ in newcomers),
+            "new_viewer_ids": tuple(uid for _, uid in newcomers),
             "message_count": len(batch),
             "trigger": "bilibili_live",
             "event_kinds": tuple(sorted(kinds)),
         }
-        if "live_advanced_chat" in kinds:
-            kind = "live_advanced_chat"
-        elif "live_gift" in kinds:
+        if "live_gift" in kinds:
             kind = "live_gift"
+        elif "live_advanced_chat" in kinds:
+            kind = "live_advanced_chat"
         elif kinds == {"live_viewer_entered"}:
             kind = "live_viewer_entered"
         else:
@@ -259,14 +369,18 @@ class BilibiliLiveRuntime:
             len(batch),
             (time.monotonic() - oldest_received) * 1000,
             (time.monotonic() - started_at) * 1000,
-            self._queue.qsize(),
+            len(self._pending),
         )
+        retry = False
         for session in self._target_resolver():
             submit_started = time.monotonic()
             try:
-                await self._submit_observation(
+                submitted = await self._submit_observation(
                     session, {"kind": kind, "payload": payload}
                 )
+                if not submitted:
+                    retry = True
+                    continue
                 logger.info(
                     "DIAG live_input.turn_finished batch_id=%s session=%s "
                     "turn_ms=%.1f total_ms=%.1f",
@@ -275,14 +389,20 @@ class BilibiliLiveRuntime:
                     (time.monotonic() - submit_started) * 1000,
                     (time.monotonic() - oldest_received) * 1000,
                 )
+                # One batch maps to one Core turn even if legacy settings
+                # provide multiple candidates for the same presentation target.
+                return True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
+                # The output may already have started. Do not risk a double thank-you.
                 logger.warning(
                     "AG99live Bilibili observation failed session=%s error=%s",
                     session,
                     exc,
                 )
+                return True
+        return not retry
 
 
 if blivedm is not None:
@@ -292,8 +412,17 @@ if blivedm is not None:
             self._runtime = runtime
 
         def _on_danmaku(self, client, message) -> None:
-            del client
-            self._runtime.enqueue_danmaku(message.uname, message.uid, message.msg)
+            fan_level = (
+                max(0, int(message.medal_level or 0))
+                if message.medal_room_id in {client.room_id, self._runtime.room_id}
+                else 0
+            )
+            self._runtime.enqueue_danmaku(
+                message.uname,
+                message.uid,
+                message.msg,
+                fan_level=fan_level,
+            )
 
         def _on_interact_word_v2(self, client, message) -> None:
             del client
@@ -306,14 +435,18 @@ if blivedm is not None:
                 message.uname,
                 message.uid,
                 f"赠送{message.gift_name} x{message.num}。",
+                paid_coins=message.total_coin if message.coin_type == "gold" else 0,
             )
 
         def _on_buy_guard(self, client, message) -> None:
             del client
+            guard_name = {1: "总督", 2: "提督", 3: "舰长"}.get(
+                message.guard_level, "大航海"
+            )
             self._runtime.enqueue_gift(
                 message.username,
                 message.uid,
-                f"开通舰队等级 {message.guard_level}。",
+                f"开通{guard_name}。",
             )
 
         def _on_super_chat(self, client, message) -> None:
@@ -322,6 +455,7 @@ if blivedm is not None:
                 message.uname,
                 message.uid,
                 message.message,
+                paid_coins=message.price * 1000,
             )
 
 else:
