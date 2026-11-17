@@ -1,1 +1,3 @@
-blivedm @ git+https://github.com/xfgryujk/blivedm.git@master
+# Install from the AstrBot root, as AstrBot's plugin installer does.
+--find-links ./data/plugins/astrbot_plugin_ag99live_stream_host/vendor
+blivedm==1.1.7+ag99.1

@@ -9,7 +9,7 @@
 - 持久化已见过的 B 站 UID/昵称，用于识别新观众；不会保存 Cookie 或原始弹幕历史。
 - 用户单独发送 `+` 或 `-` 时，不触发普通对话；当前只记录输入时间、评价值、来源会话和符号，写入 `motion_feedback.jsonl`，动作关联留到后续校准阶段。
 
-AG99live 前端不再需要连接 B 站；插件生成的事件会经过 Core pipeline、Personal、Persona、TTS、分段输出和动作链路。主动话题也会优先通过同一个输入适配器提交。旧版插件配置保留了直接调用 OLV `input.text` 的迁移路径。`blivedm` 按其上游仓库的 Git 依赖安装，因为它没有发布可用的 PyPI 版本。
+AG99live 前端不再需要连接 B 站；插件生成的事件会经过 Core pipeline、Personal、Persona、TTS、分段输出和动作链路。主动话题也会优先通过同一个输入适配器提交。旧版插件配置保留了直接调用 OLV `input.text` 的迁移路径。`blivedm` 使用随插件分发的依赖修订构建，来源和构建方法见 [vendor/README.md](vendor/README.md)。安装时从 AstrBot 根目录运行 `uv pip install --python .venv/Scripts/python.exe -r data/plugins/astrbot_plugin_ag99live_stream_host/requirements.txt`；不要重新安装上游 master，它的旧版 aiohttp/Brotli 约束与宿主冲突。
 
 配置 `session_targets` 时填写 OLV 的 UMO，例如：
 
