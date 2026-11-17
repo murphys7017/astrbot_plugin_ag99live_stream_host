@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
@@ -76,7 +77,7 @@ class AG99liveStreamInputPlatform(Platform):
 
     def meta(self) -> PlatformMetadata:
         metadata = PlatformMetadata(
-            name=_PRESENTATION_PLATFORM_NAME,
+            name=_PLATFORM_TYPE,
             description=(
                 "AG99live Stream 输入平台；输入进入 Core，表现输出交给 OLV。"
             ),
@@ -179,7 +180,10 @@ class AG99liveStreamInputPlatform(Platform):
             raise RuntimeError("ag99live_stream_input_olv_adapter_unavailable")
         event = olv_adapter.build_stream_input_event(
             message,
-            platform_meta=self.meta(),
+            # The platform registry must see an independent input source.
+            # Only this OLV-backed event uses the presentation hook contract;
+            # its source platform id remains the input adapter's id.
+            platform_meta=replace(self.meta(), name=_PRESENTATION_PLATFORM_NAME),
             session_id=self.presentation_session_id,
         )
         event.set_extra("live_source_platform_id", self.platform_id)
