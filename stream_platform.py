@@ -178,21 +178,23 @@ class AG99liveStreamInputPlatform(Platform):
         olv_adapter = _resolve_olv_adapter(self.presentation_platform_id)
         if olv_adapter is None:
             raise RuntimeError("ag99live_stream_input_olv_adapter_unavailable")
-        event = olv_adapter.build_stream_input_event(
+        await olv_adapter.submit_stream_input_event(
             message,
             # The platform registry must see an independent input source.
             # Only this OLV-backed event uses the presentation hook contract;
             # its source platform id remains the input adapter's id.
             platform_meta=replace(self.meta(), name=_PRESENTATION_PLATFORM_NAME),
             session_id=self.presentation_session_id,
+            event_extras={
+                "live_source_platform_id": self.platform_id,
+                "live_event_kind": kind,
+                "live_presentation_target": {
+                    "platform_id": self.presentation_platform_id,
+                    "session_id": self.presentation_session_id,
+                },
+            },
+            commit_event=self.commit_event,
         )
-        event.set_extra("live_source_platform_id", self.platform_id)
-        event.set_extra("live_event_kind", kind)
-        event.set_extra("live_presentation_target", {
-            "platform_id": self.presentation_platform_id,
-            "session_id": self.presentation_session_id,
-        })
-        self.commit_event(event)
 
 
 def _resolve_olv_adapter(platform_id: str) -> Any | None:
