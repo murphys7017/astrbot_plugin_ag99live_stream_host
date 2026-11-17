@@ -67,6 +67,7 @@ class BilibiliLiveRuntime:
         self._client = None
         self._flush_task: asyncio.Task[None] | None = None
         self._closed = False
+        self.last_received_at = time.monotonic()
 
     @staticmethod
     def dependency_available() -> bool:
@@ -151,6 +152,7 @@ class BilibiliLiveRuntime:
     def _enqueue(self, item: LiveInput) -> None:
         if self._closed or not item.name:
             return
+        self.last_received_at = time.monotonic()
         if self._processing or not self._can_accept_input():
             self._dropped_while_busy += 1
             return
@@ -166,7 +168,10 @@ class BilibiliLiveRuntime:
                 logger.warning("AG99live Bilibili input queue is full; event dropped")
         logger.debug(
             "DIAG live_input.received room=%s kind=%s received_at=%.3f queue_size=%s",
-            self.room_id, item.kind, item.received_at, self._queue.qsize(),
+            self.room_id,
+            item.kind,
+            item.received_at,
+            self._queue.qsize(),
         )
 
     async def _flush_loop(self) -> None:
@@ -188,7 +193,8 @@ class BilibiliLiveRuntime:
                     self._queue.get_nowait()
                 logger.info(
                     "DIAG live_input.ready room=%s dropped_while_busy=%s",
-                    self.room_id, self._dropped_while_busy,
+                    self.room_id,
+                    self._dropped_while_busy,
                 )
                 self._dropped_while_busy = 0
                 self._processing = False
@@ -247,18 +253,26 @@ class BilibiliLiveRuntime:
         logger.info(
             "DIAG live_input.batch_ready room=%s batch_id=%s kind=%s count=%s "
             "oldest_wait_ms=%.1f prepare_ms=%.1f queue_size=%s",
-            self.room_id, batch_id, kind, len(batch),
+            self.room_id,
+            batch_id,
+            kind,
+            len(batch),
             (time.monotonic() - oldest_received) * 1000,
-            (time.monotonic() - started_at) * 1000, self._queue.qsize(),
+            (time.monotonic() - started_at) * 1000,
+            self._queue.qsize(),
         )
         for session in self._target_resolver():
             submit_started = time.monotonic()
             try:
-                await self._submit_observation(session, {"kind": kind, "payload": payload})
+                await self._submit_observation(
+                    session, {"kind": kind, "payload": payload}
+                )
                 logger.info(
                     "DIAG live_input.turn_finished batch_id=%s session=%s "
                     "turn_ms=%.1f total_ms=%.1f",
-                    batch_id, session, (time.monotonic() - submit_started) * 1000,
+                    batch_id,
+                    session,
+                    (time.monotonic() - submit_started) * 1000,
                     (time.monotonic() - oldest_received) * 1000,
                 )
             except asyncio.CancelledError:

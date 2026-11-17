@@ -55,6 +55,8 @@ class AG99liveStreamHostPlugin(Star):
         self.config = dict(config) if isinstance(config, Mapping) else {}
         self.enabled = bool(self.config.get("enabled", True))
         self._sensor = None
+        self._schedule_signature = None
+        self._last_activity_at = time.monotonic()
         self._topic_task: asyncio.Task[None] | None = None
         self._bilibili_runtime: BilibiliLiveRuntime | None = None
         self._state_lock = asyncio.Lock()
@@ -74,16 +76,10 @@ class AG99liveStreamHostPlugin(Star):
         set_stream_platform_context(self.context, self._remember_viewer)
         if not self.enabled:
             return
-        register_sensor = getattr(
-            self.context, "register_runtime_observation_sensor", None
+        self._sensor = self.context.register_runtime_observation_sensor(
+            _LiveHostSensor()
         )
-        if callable(register_sensor):
-            self._sensor = register_sensor(_LiveHostSensor())
-        else:
-            logger.warning(
-                "AG99live Stream Host Runtime Observation Sensor is unavailable; "
-                "continuing with the input adapter and standard message pipeline."
-            )
+        self._configure_schedule()
         self._topic_task = asyncio.create_task(
             self._topic_scheduler(),
             name="ag99live-stream-host-topic-scheduler",
@@ -130,15 +126,27 @@ class AG99liveStreamHostPlugin(Star):
         event.stop_event()
         await self._record_motion_feedback(event, 1 if value == "+" else -1)
 
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_conversation_activity(self, event: AstrMessageEvent) -> None:
+        target = self._presentation_target()
+        context_target = event.get_extra("interaction.context_target")
+        if event.unified_msg_origin == target or context_target == target:
+            self._last_activity_at = time.monotonic()
+
+    @filter.after_message_sent()
+    async def on_expression_activity(self, event: AstrMessageEvent) -> None:
+        await self.on_conversation_activity(event)
+
     @filter.on_llm_request()
-    async def on_llm_request(
-        self, event: AstrMessageEvent, request: Any
-    ) -> None:
+    async def on_llm_request(self, event: AstrMessageEvent, request: Any) -> None:
         if not self.enabled or not self._is_ag99live_event(event):
             return
         message = str(getattr(event, "message_str", "") or "").strip()
         metadata = getattr(request, "metadata", None)
-        if isinstance(metadata, Mapping) and "interaction.persona_expression_intent" in metadata:
+        if (
+            isinstance(metadata, Mapping)
+            and "interaction.persona_expression_intent" in metadata
+        ):
             return
 
         live_kind = str(event.get_extra("live_event_kind") or "").strip()
@@ -165,10 +173,10 @@ class AG99liveStreamHostPlugin(Star):
     def _extract_live_viewers(
         self, event: AstrMessageEvent, message: str
     ) -> list[tuple[str, str]]:
-        raw_message = getattr(
-            getattr(event, "message_obj", None), "raw_message", None
+        raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        payload = (
+            raw_message.get("payload") if isinstance(raw_message, Mapping) else None
         )
-        payload = raw_message.get("payload") if isinstance(raw_message, Mapping) else None
         if isinstance(payload, Mapping) and isinstance(
             payload.get("live_payload"), Mapping
         ):
@@ -191,10 +199,10 @@ class AG99liveStreamHostPlugin(Star):
 
     @staticmethod
     def _extract_new_viewers(event: AstrMessageEvent) -> list[tuple[str, str]]:
-        raw_message = getattr(
-            getattr(event, "message_obj", None), "raw_message", None
+        raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        payload = (
+            raw_message.get("payload") if isinstance(raw_message, Mapping) else None
         )
-        payload = raw_message.get("payload") if isinstance(raw_message, Mapping) else None
         if isinstance(payload, Mapping) and isinstance(
             payload.get("live_payload"), Mapping
         ):
@@ -215,6 +223,7 @@ class AG99liveStreamHostPlugin(Star):
             for index, name in enumerate(names)
             if str(name).strip()
         ]
+
     async def _record_motion_feedback(
         self, event: AstrMessageEvent, value: int
     ) -> None:
@@ -240,57 +249,79 @@ class AG99liveStreamHostPlugin(Star):
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     async def _topic_scheduler(self) -> None:
+        next_check_at = 0.0
         while True:
             interval = self._topic_interval()
-            await asyncio.sleep(interval)
-            if not self.enabled:
-                continue
-            input_adapter = self._stream_input_adapter()
-            if input_adapter is not None:
-                submit_live_item = getattr(input_adapter, "submit_live_item", None)
-                if callable(submit_live_item):
-                    try:
-                        await submit_live_item(
-                            {
-                                "kind": "live_topic",
-                                "payload": {
-                                    "ambient_message_excerpt": (
-                                        "当前没有新的观众消息，请结合近期上下文自然开启一个简短话题。"
-                                    ),
-                                    "trigger": "scheduled_topic",
-                                },
-                            }
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "AG99live live topic input adapter submission failed error=%s",
-                            exc,
-                        )
+            await asyncio.sleep(5)
+            try:
+                self._configure_schedule()
+                if not self.enabled or self._schedule_mode() != "live":
                     continue
-            sessions = self._target_sessions()
-            if sessions:
-                try:
-                    await self._submit_live_message(
-                        sessions[0],
-                        {
-                            "kind": "live_topic",
-                            "payload": {
-                                "ambient_message_excerpt": (
-                                    "当前没有新的观众消息，请结合近期上下文自然开启一个简短话题。"
-                                ),
-                                "trigger": "scheduled_topic",
-                            },
-                        },
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "AG99live live topic message submission failed error=%s",
-                        exc,
-                    )
+                adapter = self._stream_input_adapter()
+                if adapter is None or adapter.is_busy():
+                    continue
+                idle_seconds = min(
+                    time.monotonic() - self._last_activity_at,
+                    adapter.viewer_idle_seconds(),
+                )
+                if idle_seconds < interval or time.monotonic() < next_check_at:
+                    continue
+                next_check_at = time.monotonic() + interval
+                result = await self._sensor.submit(
+                    kind="proactive_schedule_due",
+                    session=self._presentation_target(),
+                    payload={
+                        "scene": "live",
+                        "trigger": "idle",
+                        "idle_seconds": int(idle_seconds),
+                    },
+                    expires_in_seconds=120,
+                    coalesce_key="schedule_due",
+                )
+                logger.debug(
+                    "Live proactive opportunity submitted: target=%s status=%s",
+                    self._presentation_target(),
+                    getattr(result, "status", "suppressed"),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Live proactive opportunity submission failed")
+
+    def _schedule_mode(self) -> str:
+        mode = str(self.config.get("proactive_mode", "daily"))
+        if mode not in {"daily", "live", "off"}:
+            raise ValueError("proactive_mode must be daily, live or off")
+        return mode if self.enabled else "off"
+
+    def _presentation_target(self) -> str | None:
+        adapter = self._stream_input_adapter()
+        if adapter is None:
+            return None
+        return f"{adapter.presentation_platform_id}:FriendMessage:{adapter.presentation_session_id}"
+
+    def _configure_schedule(self) -> None:
+        target = self._presentation_target()
+        if not target or self._sensor is None:
+            return
+        signature = (
+            target,
+            self._schedule_mode(),
+            float(self.config.get("live_reply_cooldown_seconds", 300)),
+            float(self.config.get("live_no_action_cooldown_seconds", 60)),
+            int(self.config.get("live_daily_output_limit", 24)),
+        )
+        if signature == self._schedule_signature:
+            return
+        self._sensor.configure_schedule(
+            session=target,
+            mode=signature[1],
+            reply_cooldown_seconds=signature[2],
+            no_action_cooldown_seconds=signature[3],
+            daily_output_limit=signature[4],
+        )
+        self._schedule_signature = signature
+        self._last_activity_at = time.monotonic()
 
     def _stream_input_adapter(self) -> Any | None:
         platform_id = str(
@@ -438,9 +469,7 @@ class AG99liveStreamHostPlugin(Star):
 def _resolve_event_timestamp(event: AstrMessageEvent) -> float:
     raw_message = getattr(event, "raw_message", None)
     if not isinstance(raw_message, Mapping):
-        raw_message = getattr(
-            getattr(event, "message_obj", None), "raw_message", None
-        )
+        raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
     candidates = (
         raw_message.get("timestamp") if isinstance(raw_message, Mapping) else None,
         raw_message.get("received_at") if isinstance(raw_message, Mapping) else None,

@@ -66,7 +66,8 @@ class AG99liveStreamInputPlatform(Platform):
         self.settings = platform_settings or {}
         self.platform_id = str(platform_config.get("id") or _PLATFORM_TYPE).strip()
         self.presentation_platform_id = str(
-            platform_config.get("presentation_platform_id") or _PRESENTATION_PLATFORM_NAME
+            platform_config.get("presentation_platform_id")
+            or _PRESENTATION_PLATFORM_NAME
         ).strip()
         self.presentation_session_id = str(
             platform_config.get("presentation_session_id") or "desktop-client"
@@ -74,13 +75,12 @@ class AG99liveStreamInputPlatform(Platform):
         self._runtime: BilibiliLiveRuntime | None = None
         self._turn_in_progress = False
         self._seen_viewers: set[str] = set()
+        self.last_viewer_activity_at = time.monotonic()
 
     def meta(self) -> PlatformMetadata:
         metadata = PlatformMetadata(
             name=_PLATFORM_TYPE,
-            description=(
-                "AG99live Stream 输入平台；输入进入 Core，表现输出交给 OLV。"
-            ),
+            description=("AG99live Stream 输入平台；输入进入 Core，表现输出交给 OLV。"),
             id=self.platform_id,
             support_proactive_message=False,
             support_personal_runtime=False,
@@ -123,16 +123,28 @@ class AG99liveStreamInputPlatform(Platform):
 
     async def submit_live_item(self, item: Mapping[str, object]) -> None:
         """Commit a plugin-generated live event through this input adapter."""
+        if item.get("kind") == "live_topic":
+            raise ValueError("live_topic must use the Runtime Observation sensor")
         if self._runtime is not None and self._runtime.is_processing:
             return
         await self._commit_live_message(self.presentation_session_id, item)
 
     def is_busy(self) -> bool:
         adapter = _resolve_olv_adapter(self.presentation_platform_id)
-        session = getattr(adapter, "session_state", None)
-        return self._turn_in_progress or bool(getattr(session, "current_turn_id", None))
+        return (
+            self._turn_in_progress
+            or adapter is None
+            or not adapter.is_proactive_output_available()
+        )
+
+    def viewer_idle_seconds(self) -> float:
+        last = self.last_viewer_activity_at
+        if self._runtime is not None:
+            last = max(last, self._runtime.last_received_at)
+        return max(0.0, time.monotonic() - last)
 
     async def _record_viewer(self, name: str, uid: str) -> bool:
+        self.last_viewer_activity_at = time.monotonic()
         if _viewer_recorder is not None:
             return await _viewer_recorder(name, uid)
         key = str(uid or "").strip() or f"name:{str(name or '').strip().casefold()}"
@@ -151,6 +163,8 @@ class AG99liveStreamInputPlatform(Platform):
         excerpt = str(payload.get("ambient_message_excerpt") or "").strip()
         if not excerpt:
             return
+        if kind != "live_topic":
+            self.last_viewer_activity_at = time.monotonic()
         if self.is_busy():
             return
         event_text = _format_live_message(kind, payload)
@@ -197,6 +211,10 @@ class AG99liveStreamInputPlatform(Platform):
                 event_extras={
                     "live_source_platform_id": self.platform_id,
                     "live_event_kind": kind,
+                    "interaction.context_target": (
+                        f"{self.presentation_platform_id}:FriendMessage:{self.presentation_session_id}"
+                    ),
+                    "interaction.context_visibility": "public",
                     "live_presentation_target": {
                         "platform_id": self.presentation_platform_id,
                         "session_id": self.presentation_session_id,
@@ -206,19 +224,24 @@ class AG99liveStreamInputPlatform(Platform):
             )
             logger.info(
                 "DIAG live_input.submitted core_turn_id=%s delivery_turn_id=%s",
-                message_id, delivery_turn_id,
+                message_id,
+                delivery_turn_id,
             )
             success, reason = await olv_adapter.turn_coordinator.wait_for_turn_finished(
-                turn_id=delivery_turn_id, timeout_seconds=300,
+                turn_id=delivery_turn_id,
+                timeout_seconds=300,
             )
             logger.info(
                 "DIAG live_input.playback_finished core_turn_id=%s success=%s reason=%s",
-                message_id, success, reason,
+                message_id,
+                success,
+                reason,
             )
         except (TimeoutError, asyncio.CancelledError):
             if delivery_turn_id:
                 await olv_adapter.turn_coordinator.abort_turn_from_backend(
-                    turn_id=delivery_turn_id, reason="stream_input_wait_aborted",
+                    turn_id=delivery_turn_id,
+                    reason="stream_input_wait_aborted",
                 )
             raise
         finally:

@@ -4,6 +4,24 @@
     "type": "bool",
     "default": true
   },
+  "proactive_mode": {
+    "description": "本 AG99 目标的主动话题模式：daily 日常、live 直播、off 关闭；修改后重载插件",
+    "type": "string",
+    "options": ["daily", "live", "off"],
+    "default": "daily"
+  },
+  "live_reply_cooldown_seconds": {
+    "description": "直播模式表达完成后的主动话题冷却（秒）",
+    "type": "int", "default": 300
+  },
+  "live_no_action_cooldown_seconds": {
+    "description": "直播模式决定保持安静后的重新评估间隔（秒）",
+    "type": "int", "default": 60
+  },
+  "live_daily_output_limit": {
+    "description": "每天直播主动表达次数上限；与日常分别计数",
+    "type": "int", "default": 24
+  },
   "session_targets": {
     "description": "Personal Runtime 目标会话 UMO 列表；留空时使用 AstrBot 已配置的目标",
     "type": "list",

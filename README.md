@@ -9,7 +9,11 @@
 - 持久化已见过的 B 站 UID/昵称，用于识别新观众；不会保存 Cookie 或原始弹幕历史。
 - 用户单独发送 `+` 或 `-` 时，不触发普通对话；当前只记录输入时间、评价值、来源会话和符号，写入 `motion_feedback.jsonl`，动作关联留到后续校准阶段。
 
-AG99live 前端不再需要连接 B 站；插件生成的事件会经过 Core pipeline、Personal、Persona、TTS、分段输出和动作链路。主动话题和旧版直连配置也统一通过同一个输入适配器提交。`blivedm` 使用随插件分发的依赖修订构建，来源和构建方法见 [vendor/README.md](vendor/README.md)。安装时从 AstrBot 根目录运行 `uv pip install --python .venv/Scripts/python.exe -r data/plugins/astrbot_plugin_ag99live_stream_host/requirements.txt`；不要重新安装上游 master，它的旧版 aiohttp/Brotli 约束与宿主冲突。
+AG99live 前端不再需要连接 B 站；真实观众事件经过输入适配器和 Core pipeline。定时话题只提交结构化观察事实，由 Personal 判断是否表达，再经 Persona、TTS 和 AG99 输出；不再伪造一条观众消息。`blivedm` 使用随插件分发的依赖修订构建，来源和构建方法见 [vendor/README.md](vendor/README.md)。安装时从 AstrBot 根目录运行 `uv pip install --python .venv/Scripts/python.exe -r data/plugins/astrbot_plugin_ag99live_stream_host/requirements.txt`；不要重新安装上游 master，它的旧版 aiohttp/Brotli 约束与宿主冲突。
+
+`proactive_mode` 决定输入适配器所绑定的 AG99 表现目标使用哪一种主动话题来源：`daily` 使用原有主动聊天插件，`live` 使用直播空闲机会，`off` 关闭这两类定时话题。默认 `daily`，其他平台会话不受影响。修改配置后重载插件。`live_reply_cooldown_seconds`、`live_no_action_cooldown_seconds`、`live_daily_output_limit` 分别控制直播冷却、静默后评估间隔和每日次数；日常、直播次数分别持久化。
+
+直播输入保留自身来源平台，但通过表现目标绑定配置、人格和角色历史。直播只读取明确标为公开的消息；日常私聊和旧的无标记记录不会自动进入直播提示词。尚未分级的记忆快照不注入直播；记忆和静态扩展槽须声明 `meta.visibility=public`，动态提示词提供者须声明 `prompt_message_visibility=public`，才能进入公开场景。日常模式可接续角色已有历史。历史不会批量迁移或合并。主动表达与普通对话使用相同的人格基础材料和有预算的历史选择，不再固定只取两轮。AG99 主动输出在同一回合发送文本和音频，并等待前端完成回执后结算；前端离线不预生成待补发话题。模式切换撤销待执行机会，已经交接到输出的分段继续完成；用户仍可打断。
 
 配置 `session_targets` 时填写 OLV 的 UMO，例如：
 
@@ -19,7 +23,7 @@ olv_pet_adapter:FriendMessage:desktop-client
 
 留空则使用 AstrBot Personal Runtime 已配置的目标会话。
 
-主动话题默认提交到 `ag99live_stream` 输入适配器；如果平台配置使用了其他实例 ID，设置插件配置项 `stream_input_platform_id`。
+`stream_input_platform_id` 指定直播输入适配器实例；主动话题的实际观察目标由该实例的 `presentation_platform_id` 和 `presentation_session_id` 确定。
 
 启用直接连接时至少配置：
 
