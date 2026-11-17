@@ -9,7 +9,7 @@
 - 持久化已见过的 B 站 UID/昵称，用于识别新观众；不会保存 Cookie 或原始弹幕历史。
 - 用户单独发送 `+` 或 `-` 时，不触发普通对话；当前只记录输入时间、评价值、来源会话和符号，写入 `motion_feedback.jsonl`，动作关联留到后续校准阶段。
 
-AG99live 前端不再需要连接 B 站；插件生成的事件会经过 Core pipeline、Personal、Persona、TTS、分段输出和动作链路。主动话题也会优先通过同一个输入适配器提交。旧版插件配置保留了直接调用 OLV `input.text` 的迁移路径。`blivedm` 使用随插件分发的依赖修订构建，来源和构建方法见 [vendor/README.md](vendor/README.md)。安装时从 AstrBot 根目录运行 `uv pip install --python .venv/Scripts/python.exe -r data/plugins/astrbot_plugin_ag99live_stream_host/requirements.txt`；不要重新安装上游 master，它的旧版 aiohttp/Brotli 约束与宿主冲突。
+AG99live 前端不再需要连接 B 站；插件生成的事件会经过 Core pipeline、Personal、Persona、TTS、分段输出和动作链路。主动话题和旧版直连配置也统一通过同一个输入适配器提交。`blivedm` 使用随插件分发的依赖修订构建，来源和构建方法见 [vendor/README.md](vendor/README.md)。安装时从 AstrBot 根目录运行 `uv pip install --python .venv/Scripts/python.exe -r data/plugins/astrbot_plugin_ag99live_stream_host/requirements.txt`；不要重新安装上游 master，它的旧版 aiohttp/Brotli 约束与宿主冲突。
 
 配置 `session_targets` 时填写 OLV 的 UMO，例如：
 
@@ -49,8 +49,11 @@ Cookie 只填写 `SESSDATA` 的值；不填写时仍可连接，但观众昵称�
   cookie: "可选的 SESSDATA"
   presentation_platform_id: olv_pet_adapter
   presentation_session_id: desktop-client
-  response_interval_seconds: 30
   max_batch_size: 8
 ```
 
 `presentation_session_id` 是 OLV 桌宠表现端的客户端会话 ID。平台适配器会把 B 站事件提交到 Core 全局消息队列，输出继续由 OLV Adapter 表现。
+
+空闲时收到弹幕立即提交，最多合并 `max_batch_size` 条已经同时到达的事件，不等待凑批。AI 生成和桌宠播放期间的新事件直接丢弃；超过本批上限的已有事件也丢弃。收到 OLV 轮次结束回执后重新接收新弹幕，不回放旧队列；主动话题同样不会打断正在回复的轮次。已取消 `response_interval_seconds` 和 `bilibili_live_response_interval`。
+
+日志 `live_input.received`、`live_input.batch_ready`、`live_input.submitted`、`live_input.playback_finished` 记录接收、排队、入队及播放结束；`batch_id` 沿用为 Core turn ID。`live_input.ready` 记录忙碌期间丢弃的数量。等待结束回执设有 300 秒故障上限，超时中止该轮次，防止断线或丢失回执导致永久忙碌；正常收到回执即恢复接收。

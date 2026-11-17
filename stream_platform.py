@@ -47,7 +47,6 @@ def set_stream_platform_context(
         "cookie": "",
         "presentation_platform_id": "olv_pet_adapter",
         "presentation_session_id": "desktop-client",
-        "response_interval_seconds": 30,
         "max_batch_size": 8,
         "max_queue_size": 80,
     },
@@ -73,6 +72,7 @@ class AG99liveStreamInputPlatform(Platform):
             platform_config.get("presentation_session_id") or "desktop-client"
         ).strip()
         self._runtime: BilibiliLiveRuntime | None = None
+        self._turn_in_progress = False
         self._seen_viewers: set[str] = set()
 
     def meta(self) -> PlatformMetadata:
@@ -95,14 +95,12 @@ class AG99liveStreamInputPlatform(Platform):
         self._runtime = BilibiliLiveRuntime(
             room_id=room_id,
             cookie=str(self.config.get("cookie") or ""),
-            response_interval_seconds=self.config.get(
-                "response_interval_seconds", 30
-            ),
             max_batch_size=self.config.get("max_batch_size", 8),
             max_queue_size=self.config.get("max_queue_size", 80),
             target_resolver=lambda: (self.presentation_session_id,),
             submit_observation=self._commit_live_message,
             record_viewer=self._record_viewer,
+            can_accept_input=lambda: not self.is_busy(),
         )
         await self._runtime.start()
         try:
@@ -125,7 +123,14 @@ class AG99liveStreamInputPlatform(Platform):
 
     async def submit_live_item(self, item: Mapping[str, object]) -> None:
         """Commit a plugin-generated live event through this input adapter."""
+        if self._runtime is not None and self._runtime.is_processing:
+            return
         await self._commit_live_message(self.presentation_session_id, item)
+
+    def is_busy(self) -> bool:
+        adapter = _resolve_olv_adapter(self.presentation_platform_id)
+        session = getattr(adapter, "session_state", None)
+        return self._turn_in_progress or bool(getattr(session, "current_turn_id", None))
 
     async def _record_viewer(self, name: str, uid: str) -> bool:
         if _viewer_recorder is not None:
@@ -146,8 +151,10 @@ class AG99liveStreamInputPlatform(Platform):
         excerpt = str(payload.get("ambient_message_excerpt") or "").strip()
         if not excerpt:
             return
+        if self.is_busy():
+            return
         event_text = _format_live_message(kind, payload)
-        message_id = uuid4().hex
+        message_id = str(payload.get("batch_id") or uuid4().hex)
         message = AstrBotMessage()
         message.type = MessageType.FRIEND_MESSAGE
         names = payload.get("participant_names")
@@ -178,23 +185,44 @@ class AG99liveStreamInputPlatform(Platform):
         olv_adapter = _resolve_olv_adapter(self.presentation_platform_id)
         if olv_adapter is None:
             raise RuntimeError("ag99live_stream_input_olv_adapter_unavailable")
-        await olv_adapter.submit_stream_input_event(
-            message,
-            # The platform registry must see an independent input source.
-            # Only this OLV-backed event uses the presentation hook contract;
-            # its source platform id remains the input adapter's id.
-            platform_meta=replace(self.meta(), name=_PRESENTATION_PLATFORM_NAME),
-            session_id=self.presentation_session_id,
-            event_extras={
-                "live_source_platform_id": self.platform_id,
-                "live_event_kind": kind,
-                "live_presentation_target": {
-                    "platform_id": self.presentation_platform_id,
-                    "session_id": self.presentation_session_id,
+        self._turn_in_progress = True
+        delivery_turn_id = None
+        try:
+            delivery_turn_id = await olv_adapter.submit_stream_input_event(
+                message,
+                # Registry type is independent; only OLV-backed events use
+                # presentation hooks while retaining the input platform id.
+                platform_meta=replace(self.meta(), name=_PRESENTATION_PLATFORM_NAME),
+                session_id=self.presentation_session_id,
+                event_extras={
+                    "live_source_platform_id": self.platform_id,
+                    "live_event_kind": kind,
+                    "live_presentation_target": {
+                        "platform_id": self.presentation_platform_id,
+                        "session_id": self.presentation_session_id,
+                    },
                 },
-            },
-            commit_event=self.commit_event,
-        )
+                commit_event=self.commit_event,
+            )
+            logger.info(
+                "DIAG live_input.submitted core_turn_id=%s delivery_turn_id=%s",
+                message_id, delivery_turn_id,
+            )
+            success, reason = await olv_adapter.turn_coordinator.wait_for_turn_finished(
+                turn_id=delivery_turn_id, timeout_seconds=300,
+            )
+            logger.info(
+                "DIAG live_input.playback_finished core_turn_id=%s success=%s reason=%s",
+                message_id, success, reason,
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            if delivery_turn_id:
+                await olv_adapter.turn_coordinator.abort_turn_from_backend(
+                    turn_id=delivery_turn_id, reason="stream_input_wait_aborted",
+                )
+            raise
+        finally:
+            self._turn_in_progress = False
 
 
 def _resolve_olv_adapter(platform_id: str) -> Any | None:

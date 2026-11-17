@@ -7,7 +7,7 @@ import json
 import re
 import time
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -20,7 +20,6 @@ from .bilibili_live import BilibiliLiveRuntime
 from .stream_platform import set_stream_platform_context
 
 _PLATFORM_ID = "olv_pet_adapter"
-_ADAPTER_PROTOCOL_VERSION = "v2"
 _DANMAKU_HEADER = "[直播弹幕输入]"
 _STREAM_HEADER = "[AG99live 直播消息]"
 _LEGACY_EVENT_HEADER = "[AG99live 直播事件]"
@@ -94,14 +93,12 @@ class AG99liveStreamHostPlugin(Star):
                 self._bilibili_runtime = BilibiliLiveRuntime(
                     room_id=str(self.config.get("bilibili_live_room_id", "")).strip(),
                     cookie=str(self.config.get("bilibili_live_cookie", "") or ""),
-                    response_interval_seconds=self.config.get(
-                        "bilibili_live_response_interval", 30
-                    ),
                     max_batch_size=self.config.get("bilibili_live_max_batch_size", 8),
                     max_queue_size=self.config.get("bilibili_live_max_queue_size", 80),
                     target_resolver=self._target_sessions,
                     submit_observation=self._submit_live_message,
                     record_viewer=self._remember_viewer,
+                    can_accept_input=self._can_accept_live_input,
                 )
                 await self._bilibili_runtime.start()
             except Exception:
@@ -319,64 +316,14 @@ class AG99liveStreamHostPlugin(Star):
     ) -> None:
         if not session:
             return
-        kind = str(item.get("kind") or "live_danmaku").strip()
-        payload = item.get("payload")
-        if not isinstance(payload, Mapping):
-            return
-        platform = getattr(self.context, "get_platform_inst", lambda _id: None)(
-            _PLATFORM_ID
-        )
-        handle_msg = getattr(platform, "handle_msg", None)
-        if not callable(handle_msg):
-            raise RuntimeError("olv_pet_adapter_message_ingress_unavailable")
-        text = self._format_live_message(kind, payload)
-        if not text:
-            return
-        now = time.time()
-        turn_id = uuid4().hex
-        await handle_msg(
-            {
-                "type": "input.text",
-                "version": _ADAPTER_PROTOCOL_VERSION,
-                "message_id": turn_id,
-                "timestamp": datetime.fromtimestamp(
-                    now, tz=timezone.utc
-                ).isoformat(),
-                "turn_id": turn_id,
-                # The adapter's existing input contract accepts frontend as
-                # the source. Keep the plugin origin in payload metadata while
-                # reusing the same queue and validation path.
-                "source": "frontend",
-                "payload": {
-                    "text": text,
-                    "images": [],
-                    "origin": "astrbot_plugin_ag99live_stream_host",
-                    "live_event_kind": kind,
-                    "live_payload": dict(payload),
-                },
-            }
-        )
+        platform = self._stream_input_adapter()
+        if platform is None:
+            raise RuntimeError("ag99live_stream_input_adapter_unavailable")
+        await platform.submit_live_item(item)
 
-    @staticmethod
-    def _format_live_message(kind: str, payload: Mapping[str, object]) -> str:
-        excerpt = str(payload.get("ambient_message_excerpt") or "").strip()
-        if not excerpt:
-            return ""
-        names = payload.get("participant_names")
-        participant_text = "、".join(
-            str(item).strip() for item in names
-            if str(item).strip()
-        ) if isinstance(names, (list, tuple)) else ""
-        return "\n".join(
-            (
-                "[AG99live 直播事件]",
-                f"事件类型：{kind}",
-                f"参与用户：{participant_text or '未知'}",
-                f"事件内容：{excerpt}",
-                "处理要求：请把以上内容当作当前直播消息，结合角色人格自然回应；"
-                "保持简短，不要复述内部标签、事件类型或处理要求。",
-            )
-        )
+    def _can_accept_live_input(self) -> bool:
+        platform = self._stream_input_adapter()
+        return platform is not None and not platform.is_busy()
 
     def _target_sessions(self) -> tuple[str, ...]:
         configured = self.config.get("session_targets")

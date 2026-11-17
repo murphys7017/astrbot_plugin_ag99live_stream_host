@@ -45,16 +45,6 @@
     "default": "",
     "secret": true
   },
-  "bilibili_live_response_interval": {
-    "description": "弹幕批量提交到 Personal Runtime 的最短间隔（秒）",
-    "type": "int",
-    "default": 30,
-    "slider": {
-      "min": 5,
-      "max": 600,
-      "step": 1
-    }
-  },
   "bilibili_live_max_batch_size": {
     "description": "一次送入策略链的最多弹幕/进入事件数",
     "type": "int",
