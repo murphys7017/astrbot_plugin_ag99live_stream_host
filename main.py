@@ -17,6 +17,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .bilibili_live import BilibiliLiveRuntime
+from .co_reading import CoReading, ReadingViewerContext
 from .stream_platform import set_stream_platform_context
 
 _PLATFORM_ID = "olv_pet_adapter"
@@ -58,6 +59,8 @@ class AG99liveStreamHostPlugin(Star):
         self._schedule_signature = None
         self._last_activity_at = time.monotonic()
         self._topic_task: asyncio.Task[None] | None = None
+        self._schedule_wakeup = asyncio.Event()
+        self.reading: CoReading | None = None
         self._bilibili_runtime: BilibiliLiveRuntime | None = None
         self._state_lock = asyncio.Lock()
         self._feedback_lock = asyncio.Lock()
@@ -73,9 +76,13 @@ class AG99liveStreamHostPlugin(Star):
         self._load_viewer_state()
 
     async def initialize(self) -> None:
-        set_stream_platform_context(self.context, self._remember_viewer)
         if not self.enabled:
+            set_stream_platform_context(self.context, self._remember_viewer)
             return
+        self.reading = CoReading(self, self._state_path.parent / "co-reading")
+        await self.reading.load()
+        set_stream_platform_context(self.context, self._remember_viewer, self.reading.passage_for_viewer)
+        self.context.register_prompt_extension_collector(ReadingViewerContext())
         self._sensor = self.context.register_runtime_observation_sensor(
             _LiveHostSensor()
         )
@@ -107,6 +114,10 @@ class AG99liveStreamHostPlugin(Star):
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        reading, self.reading = self.reading, None
+        if reading is not None:
+            await reading.close()
+        set_stream_platform_context(self.context, self._remember_viewer)
         bilibili, self._bilibili_runtime = self._bilibili_runtime, None
         if bilibili is not None:
             await bilibili.stop()
@@ -248,22 +259,48 @@ class AG99liveStreamHostPlugin(Star):
         with self._feedback_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    async def reading_command(self, platform_id: str, payload: dict) -> dict:
+        if self.reading is None:
+            raise RuntimeError("直播插件未启用。")
+        result = await self.reading.command(platform_id, payload)
+        self._configure_schedule()
+        self._schedule_wakeup.set()
+        return result
+
     async def _topic_scheduler(self) -> None:
         next_check_at = 0.0
         while True:
             interval = self._topic_interval()
-            await asyncio.sleep(5)
+            reading = self.reading
+            reading_active = reading is not None and reading.owns_schedule(self._presentation_target())
+            try:
+                await asyncio.wait_for(self._schedule_wakeup.wait(), timeout=0.25 if reading_active else 5)
+            except TimeoutError:
+                pass
+            self._schedule_wakeup.clear()
             try:
                 self._configure_schedule()
-                if not self.enabled or self._schedule_mode() != "live":
+                if not self.enabled:
                     continue
                 adapter = self._stream_input_adapter()
-                if adapter is None or adapter.is_busy():
+                if adapter is None:
                     continue
+                now = time.monotonic()
                 idle_seconds = min(
-                    time.monotonic() - self._last_activity_at,
+                    now - self._last_activity_at,
                     adapter.viewer_idle_seconds(),
+                    now - adapter.last_turn_finished_at,
                 )
+                if self._bilibili_runtime is not None:
+                    idle_seconds = min(idle_seconds, now - self._bilibili_runtime.last_received_at)
+                if reading is not None:
+                    if self._bilibili_runtime is None or not self._bilibili_runtime.has_pending_input:
+                        await reading.tick(adapter, idle_seconds)
+                    if reading.owns_schedule(adapter.presentation_target):
+                        continue
+                    self._configure_schedule()
+                if self._schedule_mode() != "live" or adapter.is_busy():
+                    continue
                 if idle_seconds < interval or time.monotonic() < next_check_at:
                     continue
                 next_check_at = time.monotonic() + interval
@@ -298,7 +335,7 @@ class AG99liveStreamHostPlugin(Star):
         adapter = self._stream_input_adapter()
         if adapter is None:
             return None
-        return f"{adapter.presentation_platform_id}:FriendMessage:{adapter.presentation_session_id}"
+        return adapter.presentation_target
 
     def _configure_schedule(self) -> None:
         target = self._presentation_target()
@@ -306,7 +343,7 @@ class AG99liveStreamHostPlugin(Star):
             return
         signature = (
             target,
-            self._schedule_mode(),
+            "off" if self.reading is not None and self.reading.owns_schedule(target) else self._schedule_mode(),
             float(self.config.get("live_reply_cooldown_seconds", 300)),
             float(self.config.get("live_no_action_cooldown_seconds", 60)),
             int(self.config.get("live_daily_output_limit", 24)),

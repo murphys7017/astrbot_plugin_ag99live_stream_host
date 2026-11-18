@@ -28,15 +28,18 @@ _PROTOCOL_VERSION = "v2"
 
 _plugin_context: Any | None = None
 _viewer_recorder: Callable[[str, str], Awaitable[bool]] | None = None
+_reading_passage: Callable[[str], str] | None = None
 
 
 def set_stream_platform_context(
     context: Any,
     viewer_recorder: Callable[[str, str], Awaitable[bool]] | None = None,
+    reading_passage: Callable[[str], str] | None = None,
 ) -> None:
-    global _plugin_context, _viewer_recorder
+    global _plugin_context, _viewer_recorder, _reading_passage
     _plugin_context = context
     _viewer_recorder = viewer_recorder
+    _reading_passage = reading_passage
 
 
 @register_platform_adapter(
@@ -76,6 +79,7 @@ class AG99liveStreamInputPlatform(Platform):
         self._turn_in_progress = False
         self._seen_viewers: set[str] = set()
         self.last_viewer_activity_at = time.monotonic()
+        self.last_turn_finished_at = 0.0
 
     def meta(self) -> PlatformMetadata:
         metadata = PlatformMetadata(
@@ -90,6 +94,9 @@ class AG99liveStreamInputPlatform(Platform):
 
     async def run(self) -> None:
         room_id = str(self.config.get("room_id") or "").strip()
+        if not room_id:
+            await asyncio.Future()
+            return
         if not room_id.isdecimal() or int(room_id) <= 0:
             raise RuntimeError("ag99live_stream_input_room_id_invalid")
         self._runtime = BilibiliLiveRuntime(
@@ -142,6 +149,40 @@ class AG99liveStreamInputPlatform(Platform):
         if self._runtime is not None:
             last = max(last, self._runtime.last_received_at)
         return max(0.0, time.monotonic() - last)
+
+    @property
+    def presentation_target(self) -> str:
+        return f"{self.presentation_platform_id}:FriendMessage:{self.presentation_session_id}"
+
+    def reading_output_status(self) -> str:
+        adapter = _resolve_olv_adapter(self.presentation_platform_id)
+        output_status = getattr(adapter, "plugin_commentary_output_status", None)
+        if not callable(output_status):
+            return "commentary_target_unavailable"
+        if self._turn_in_progress or (
+            self._runtime is not None and self._runtime.has_pending_input
+        ):
+            return "busy"
+        return output_status(self.presentation_session_id)
+
+    async def submit_reading_commentary(
+        self, *, owner, request_id: str, title: str, text: str, preceding: str,
+    ):
+        submit = getattr(_plugin_context, "submit_plugin_commentary", None)
+        if not callable(submit):
+            raise RuntimeError("personal_expression_unavailable")
+        if self.reading_output_status() != "ready":
+            return None
+        self._turn_in_progress = True
+        try:
+            return await submit(
+                owner=owner, source_platform_id=self.platform_id,
+                target_session=self.presentation_target, request_id=request_id,
+                title=title, text=text, preceding=preceding,
+            )
+        finally:
+            self.last_turn_finished_at = time.monotonic()
+            self._turn_in_progress = False
 
     async def _record_viewer(self, name: str, uid: str) -> bool:
         self.last_viewer_activity_at = time.monotonic()
@@ -211,10 +252,11 @@ class AG99liveStreamInputPlatform(Platform):
                 event_extras={
                     "live_source_platform_id": self.platform_id,
                     "live_event_kind": kind,
-                    "interaction.context_target": (
-                        f"{self.presentation_platform_id}:FriendMessage:{self.presentation_session_id}"
-                    ),
+                    "interaction.context_target": self.presentation_target,
                     "interaction.context_visibility": "public",
+                    "live_reading_passage": (
+                        _reading_passage(self.presentation_target) if _reading_passage else ""
+                    ),
                     "live_presentation_target": {
                         "platform_id": self.presentation_platform_id,
                         "session_id": self.presentation_session_id,
@@ -246,6 +288,7 @@ class AG99liveStreamInputPlatform(Platform):
                 )
             raise
         finally:
+            self.last_turn_finished_at = time.monotonic()
             self._turn_in_progress = False
 
 
