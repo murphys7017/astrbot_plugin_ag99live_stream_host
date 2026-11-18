@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 from dataclasses import asdict, dataclass, replace
+from os import SEEK_END
 from pathlib import Path
 from time import monotonic, time
 from uuid import uuid4
@@ -43,6 +44,7 @@ class ReadingSession:
     hold_seconds: int = 25
     interaction_seconds: int = 3
     seen: tuple[int, ...] = ()
+    preceding_positions: tuple[int, ...] = ()
     comment_status: str = "pending"
     comment: str = ""
     turn_id: str | None = None
@@ -50,6 +52,12 @@ class ReadingSession:
     error: str | None = None
     pending_position: int | None = None
     end_requested: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PendingSettlement:
+    state: ReadingSession
+    record_required: bool
 
 
 class CoReading:
@@ -60,6 +68,7 @@ class CoReading:
         self.session: ReadingSession | None = None
         self._lock = asyncio.Lock()
         self._comment_task: asyncio.Task | None = None
+        self._pending_settlement: PendingSettlement | None = None
         self._disposed = False
 
     @staticmethod
@@ -96,18 +105,20 @@ class CoReading:
                 return
             payload["passages"] = tuple(payload["passages"])
             payload["seen"] = tuple(payload["seen"])
+            payload["preceding_positions"] = tuple(
+                payload.get("preceding_positions", ())
+            )
             state = ReadingSession(**payload)
             if not 0 <= state.position < len(state.passages):
                 raise ValueError("reading_position_invalid")
             if self._owns_schedule(state):
+                if state.comment_status == "generating":
+                    state = await self._recover_interrupted_comment(state)
                 state = replace(
                     state,
                     phase="paused",
                     pending_position=None,
                     end_requested=False,
-                    comment_status="unknown"
-                    if state.comment_status == "generating"
-                    else state.comment_status,
                 )
             self.session = state
             self._publish(state)
@@ -118,6 +129,51 @@ class CoReading:
     def _read_checkpoint(self) -> dict | None:
         path = self.data_dir / "progress.json"
         return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+    async def _recover_interrupted_comment(
+        self, state: ReadingSession
+    ) -> ReadingSession:
+        try:
+            record = await asyncio.to_thread(self._read_comment_record, state)
+        except OSError:
+            logger.exception(
+                "Could not recover reading commentary: turn_id=%s", state.turn_id
+            )
+            record = None
+        if record is None:
+            return replace(state, comment_status="unknown")
+        return replace(
+            state,
+            comment_status=record["status"],
+            comment=record.get("text") or "",
+            delivery_turn_id=record.get("delivery_turn_id"),
+            error=record.get("reason"),
+        )
+
+    def _read_comment_record(self, state: ReadingSession) -> dict | None:
+        if not state.turn_id:
+            return None
+        path = self.data_dir / "comments.jsonl"
+        try:
+            handle = path.open(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return None
+        with handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if (
+                    isinstance(record, dict)
+                    and record.get("session_id") == state.session_id
+                    and record.get("visit_id") == state.visit_id
+                    and record.get("turn_id") == state.turn_id
+                    and record.get("status")
+                    in ("played", "silent", "failed", "rejected", "unknown")
+                ):
+                    return record
+        return None
 
     @staticmethod
     def _write(path: Path, payload: dict) -> None:
@@ -191,6 +247,11 @@ class CoReading:
         await asyncio.to_thread(
             self._write, self.data_dir / "progress.json", asdict(state)
         )
+        self._set_session(state, visible_change=visible_change)
+
+    def _set_session(
+        self, state: ReadingSession, *, visible_change: bool = True
+    ) -> None:
         previous = self.session
         if previous is not None and previous.target != state.target:
             self._publish(previous, clear=True)
@@ -232,7 +293,9 @@ class CoReading:
             "output_status": output_status,
             "comment_status": state.comment_status,
             "comment": state.comment,
+            "delivery_turn_id": state.delivery_turn_id,
             "error": state.error,
+            "persistence_pending": self._pending_settlement is not None,
             "pending_position": state.pending_position + 1
             if state.pending_position is not None
             else None,
@@ -259,6 +322,8 @@ class CoReading:
         async with self._lock:
             adapter = self._adapter(platform_id)
             previous = self.session
+            if self._pending_settlement is not None:
+                raise ValueError("请先重试保存上一轮共读结果。")
             if self._comment_task or (previous and previous.phase == "running"):
                 raise ValueError("请暂停共读并等待本轮结束后保存新材料。")
             if previous and previous.target == adapter.presentation_target:
@@ -299,6 +364,7 @@ class CoReading:
             visit_id=uuid4().hex,
             display_revision=state.display_revision + 1,
             pending_position=None,
+            preceding_positions=(),
             comment_status="pending",
             comment="",
             turn_id=None,
@@ -316,10 +382,20 @@ class CoReading:
             action = payload.get("action")
             if not isinstance(action, str):
                 raise ValueError("请选择有效的共读操作。")
+            pending = self._pending_settlement
+            if pending is not None:
+                if action != "retry_persistence":
+                    raise ValueError("请先重试保存上一轮共读结果。")
+                await self._save_settlement(
+                    replace(pending.state, revision=state.revision),
+                    record_required=pending.record_required,
+                    retry=True,
+                )
+                return self.view(platform_id)
             if action == "start":
-                hold = payload.get("hold_seconds", 25)
-                gap = payload.get("interaction_seconds", 3)
-                auto = payload.get("auto_advance", False)
+                hold = payload.get("hold_seconds", state.hold_seconds)
+                gap = payload.get("interaction_seconds", state.interaction_seconds)
+                auto = payload.get("auto_advance", state.auto_advance)
                 if (
                     type(hold) is not int
                     or not 5 <= hold <= 300
@@ -387,6 +463,7 @@ class CoReading:
                 or state is None
                 or state.target != adapter.presentation_target
                 or self._comment_task is not None
+                or self._pending_settlement is not None
             ):
                 return
             if (
@@ -426,23 +503,26 @@ class CoReading:
 
     async def _schedule_comment(self, state: ReadingSession) -> None:
         previous = state
-        attempt_id = uuid4().hex
+        preceding_positions = tuple(
+            sorted(i for i in state.seen if i < state.position)[-3:]
+        )
         state = replace(
-            state, comment_status="generating", turn_id=attempt_id, error=None
+            state,
+            comment_status="generating",
+            turn_id=uuid4().hex,
+            delivery_turn_id=None,
+            preceding_positions=preceding_positions,
+            error=None,
         )
         await self._update(state)
-        preceding = [
-            state.passages[i] for i in sorted(state.seen) if i < state.position
-        ][-3:]
         self._comment_task = asyncio.create_task(
-            self._comment(state, "\n\n".join(preceding), previous),
+            self._comment(state, previous),
             name="ag99live-reading-comment",
         )
 
     async def _comment(
         self,
         state: ReadingSession,
-        preceding: str,
         previous: ReadingSession,
     ) -> None:
         final = None
@@ -461,7 +541,9 @@ class CoReading:
                     request_id=state.turn_id,
                     title=state.title,
                     text=state.passages[state.position],
-                    preceding=preceding,
+                    preceding="\n\n".join(
+                        state.passages[i] for i in state.preceding_positions
+                    ),
                 )
             status = final.status if final is not None else "busy"
             reason = final.reason if final is not None else None
@@ -483,18 +565,20 @@ class CoReading:
                         and current.visit_id == state.visit_id
                     ):
                         if status == "busy":
-                            await self._update(
+                            await self._save_settlement(
                                 replace(
                                     current,
                                     comment_status=previous.comment_status,
                                     turn_id=previous.turn_id,
                                     delivery_turn_id=previous.delivery_turn_id,
+                                    preceding_positions=previous.preceding_positions,
                                     error=previous.error,
                                     phase="finished"
                                     if current.end_requested
                                     else current.phase,
                                     end_requested=False,
-                                )
+                                ),
+                                record_required=False,
                             )
                         else:
                             await self._settle(current, final, status, reason)
@@ -519,13 +603,7 @@ class CoReading:
             delivery_turn_id=result.delivery_turn_id if result else None,
             error=reason,
         )
-        await self._update(state)
-        try:
-            await asyncio.to_thread(self._record, state)
-        except OSError:
-            logger.exception(
-                "Could not write reading commentary record: turn_id=%s", state.turn_id
-            )
+        await self._save_settlement(state, record_required=True)
         logger.info(
             "Live reading settled: session_id=%s visit_id=%s turn_id=%s status=%s",
             state.session_id,
@@ -534,28 +612,57 @@ class CoReading:
             status,
         )
 
-    def _record(self, state: ReadingSession) -> None:
-        with (self.data_dir / "comments.jsonl").open("a", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    {
-                        "session_id": state.session_id,
-                        "material_version": state.material_version,
-                        "position": state.position,
-                        "visit_id": state.visit_id,
-                        "turn_id": state.turn_id,
-                        "delivery_turn_id": state.delivery_turn_id,
-                        "status": state.comment_status,
-                        "text": state.comment
-                        if state.comment_status == "played"
-                        else "",
-                        "reason": state.error,
-                        "settled_at": time(),
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
+    async def _save_settlement(
+        self, state: ReadingSession, *, record_required: bool, retry: bool = False
+    ) -> None:
+        try:
+            if record_required:
+                if (
+                    not retry
+                    or await asyncio.to_thread(self._read_comment_record, state) is None
+                ):
+                    await asyncio.to_thread(self._record, state)
+                record_required = False
+            await self._update(state)
+        except OSError:
+            self._pending_settlement = PendingSettlement(state, record_required)
+            self._set_session(
+                replace(state, phase="faulted", revision=state.revision + 1)
             )
+            logger.exception(
+                "Could not persist reading settlement: turn_id=%s", state.turn_id
+            )
+        else:
+            self._pending_settlement = None
+
+    def _record(self, state: ReadingSession) -> None:
+        record = {
+            "session_id": state.session_id,
+            "material_version": state.material_version,
+            "position": state.position,
+            "preceding_positions": state.preceding_positions,
+            "visit_id": state.visit_id,
+            "turn_id": state.turn_id,
+            "delivery_turn_id": state.delivery_turn_id,
+            "status": state.comment_status,
+            "text": state.comment if state.comment_status == "played" else "",
+            "reason": state.error,
+            "settled_at": time(),
+        }
+        line = (json.dumps(record, ensure_ascii=False) + "\n").encode()
+        path = self.data_dir / "comments.jsonl"
+        with path.open("a+b", buffering=0) as handle:
+            offset = handle.seek(0, SEEK_END)
+            if offset:
+                handle.seek(-1, SEEK_END)
+                if handle.read(1) != b"\n":
+                    line = b"\n" + line
+            try:
+                if handle.write(line) != len(line):
+                    raise OSError("Incomplete reading commentary record")
+            except OSError:
+                handle.truncate(offset)
+                raise
 
     async def close(self) -> None:
         self._disposed = True

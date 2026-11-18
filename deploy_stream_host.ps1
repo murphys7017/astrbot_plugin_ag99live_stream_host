@@ -1,6 +1,8 @@
 param(
     [string]$PluginsRoot = "C:\Users\Administrator\Downloads\AstrBot\data\plugins",
-    [switch]$DryRun
+    [switch]$DryRun,
+    [ValidateNotNullOrEmpty()]
+    [string[]]$OnlyFiles
 )
 
 Set-StrictMode -Version Latest
@@ -111,11 +113,21 @@ $SkipFilePatterns = @("*.pyc", "pytest.ini")
 $ManagedRelativeFiles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $ManagedRelativeDirectories = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
+if ($OnlyFiles) {
+    if (-not (Test-Path -LiteralPath $ResolvedTargetPluginRoot -PathType Container)) {
+        throw "A full deploy is required before deploying selected files."
+    }
+    $OnlyFiles = @($OnlyFiles | ForEach-Object { $_.Replace('/', '\') } | Sort-Object -Unique)
+}
+
 Invoke-LoggedAction -Description "Ensure target plugin directory exists: $ResolvedTargetPluginRoot" -DryRun:$DryRun -Action {
     New-Item -ItemType Directory -Path $ResolvedTargetPluginRoot -Force | Out-Null
 }
 
 $sourceDirectories = Get-ChildItem -LiteralPath $SourcePluginRoot -Recurse -Directory | Where-Object {
+    if ($OnlyFiles) {
+        return $false
+    }
     $relativePath = Get-RelativePathCompat -BasePath $SourcePluginRoot -TargetPath $_.FullName
     if ([string]::IsNullOrWhiteSpace($relativePath)) {
         return $false
@@ -141,8 +153,11 @@ foreach ($directory in $sourceDirectories) {
     }
 }
 
-$sourceFiles = Get-ChildItem -LiteralPath $SourcePluginRoot -Recurse -File | Where-Object {
+$sourceFiles = @(Get-ChildItem -LiteralPath $SourcePluginRoot -Recurse -File | Where-Object {
     $relativePath = Get-RelativePathCompat -BasePath $SourcePluginRoot -TargetPath $_.FullName
+    if ($OnlyFiles -and $relativePath -notin $OnlyFiles) {
+        return $false
+    }
     if (Test-ShouldSkipRelativePath -RelativePath $relativePath -PreserveDirectories $PreserveDirectories) {
         return $false
     }
@@ -158,6 +173,10 @@ $sourceFiles = Get-ChildItem -LiteralPath $SourcePluginRoot -Recurse -File | Whe
         }
     }
     return $true
+})
+
+if ($OnlyFiles -and $sourceFiles.Count -ne $OnlyFiles.Count) {
+    throw "One or more selected paths are not managed source files: $($OnlyFiles -join ', ')"
 }
 
 foreach ($file in $sourceFiles) {
@@ -175,7 +194,7 @@ foreach ($file in $sourceFiles) {
     }
 }
 
-if (Test-Path -LiteralPath $ResolvedTargetPluginRoot -PathType Container) {
+if (-not $OnlyFiles -and (Test-Path -LiteralPath $ResolvedTargetPluginRoot -PathType Container)) {
     $targetFiles = Get-ChildItem -LiteralPath $ResolvedTargetPluginRoot -Recurse -File | Where-Object {
         $relativePath = Get-RelativePathCompat -BasePath $ResolvedTargetPluginRoot -TargetPath $_.FullName
         if (Test-ShouldSkipRelativePath -RelativePath $relativePath -PreserveDirectories $PreserveDirectories) {
