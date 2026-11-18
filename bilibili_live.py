@@ -76,7 +76,7 @@ class BilibiliLiveRuntime:
         self._client = None
         self._flush_task: asyncio.Task[None] | None = None
         self._closed = False
-        self.last_received_at = time.monotonic()
+        self.last_received_at = 0.0
 
     @staticmethod
     def dependency_available() -> bool:

@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import secrets
+from bisect import bisect_right
 from dataclasses import asdict, dataclass, replace
 from os import SEEK_END
 from pathlib import Path
@@ -23,8 +24,13 @@ DISPLAY_SOURCE = "ag99live.stream_host"
 RENDERED_KIND = "ag99live_reading_rendered"
 RENDERED_SOURCE = "ag99live.subtitle"
 MAX_MATERIAL = 64_000
+PREFERRED_PASSAGE = 280
 MAX_PASSAGE = 400
 MAX_PASSAGES = 500
+AUDIENCE_ACTIVITY_SECONDS = 300
+LINE_BREAK_COST = 24
+_PARAGRAPH_BREAK = re.compile(r"\n(?:[^\S\n]*\n)*")
+_SENTENCE_END = re.compile(r"[。！？!?；;]+[”’」』）】]*|\.(?=\s|$)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,25 +81,46 @@ class CoReading:
     def preview(text: str) -> list[str]:
         if not isinstance(text, str) or not text.strip() or len(text) > MAX_MATERIAL:
             raise ValueError("请输入 1 到 64000 个字符的原文。")
-        paragraphs = re.split(
-            r"\n[ \t]*\n+", text.replace("\r\n", "\n").replace("\r", "\n").strip()
-        )
+        material = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        boundaries = [match.start() for match in _PARAGRAPH_BREAK.finditer(material)]
+        display_offsets = [0]
+        for character in material:
+            # Blank lines and short dialogue still occupy a full row in OBS.
+            display_offsets.append(
+                display_offsets[-1] + (LINE_BREAK_COST if character == "\n" else 1)
+            )
         passages: list[str] = []
-        for paragraph in paragraphs:
-            while len(paragraph) > MAX_PASSAGE:
-                boundaries = list(
-                    re.finditer(r"[。！？!?；;\n]", paragraph[:MAX_PASSAGE])
+        start = 0
+        while display_offsets[-1] - display_offsets[start] > MAX_PASSAGE:
+            limit = (
+                bisect_right(display_offsets, display_offsets[start] + MAX_PASSAGE) - 1
+            )
+            preferred = display_offsets[start] + PREFERRED_PASSAGE
+            paragraph_ends = boundaries[
+                bisect_right(boundaries, start) : bisect_right(boundaries, limit)
+            ]
+            if paragraph_ends:
+                cut = min(
+                    paragraph_ends,
+                    key=lambda end: abs(display_offsets[end] - preferred),
                 )
-                cut = (
-                    boundaries[-1].end()
-                    if boundaries and boundaries[-1].end() >= MAX_PASSAGE // 2
-                    else MAX_PASSAGE
+            else:
+                sentence_ends = (
+                    match.end()
+                    for match in _SENTENCE_END.finditer(material, start, limit)
+                    if match.end() >= start + MAX_PASSAGE // 2
                 )
-                passages.append(paragraph[:cut].strip())
-                paragraph = paragraph[cut:].lstrip()
-            if paragraph.strip():
-                passages.append(paragraph.strip())
-        passages = [passage for passage in passages if passage]
+                cut = min(
+                    sentence_ends,
+                    key=lambda end: abs(display_offsets[end] - preferred),
+                    default=limit,
+                )
+            passages.append(material[start:cut].rstrip())
+            start = cut
+            while start < len(material) and material[start].isspace():
+                start += 1
+        if start < len(material):
+            passages.append(material[start:])
         if len(passages) > MAX_PASSAGES:
             raise ValueError("材料超过 500 段，请合并短段或拆成几篇。")
         return passages
@@ -194,6 +221,13 @@ class CoReading:
         state = self.session
         return bool(state and state.target == target and self._owns_schedule(state))
 
+    def _recent_audience_activity(self, adapter) -> bool:
+        last = adapter.latest_viewer_activity_at
+        listener = self.plugin._bilibili_runtime
+        if listener is not None:
+            last = max(last, listener.last_received_at)
+        return last > 0 and monotonic() - last < AUDIENCE_ACTIVITY_SECONDS
+
     def _publish(self, state: ReadingSession, *, clear: bool = False) -> None:
         self.hub.publish_snapshot(
             kind=DISPLAY_KIND,
@@ -287,6 +321,11 @@ class CoReading:
             "total": len(state.passages),
             "phase": state.phase,
             "auto_advance": state.auto_advance,
+            "waiting_for_audience": (
+                state.phase == "running"
+                and state.auto_advance
+                and not self._recent_audience_activity(adapter)
+            ),
             "hold_seconds": state.hold_seconds,
             "interaction_seconds": state.interaction_seconds,
             "rendered": self._rendered_at(state) is not None,
@@ -448,7 +487,7 @@ class CoReading:
                     raise ValueError("请等待 OBS 展示当前段落。")
                 if self._comment_task or adapter.reading_output_status() != "ready":
                     raise ValueError("角色当前忙碌或离线。")
-                await self._schedule_comment(state)
+                await self._schedule_comment(state, automatic=False)
                 return self.view(platform_id)
             else:
                 raise ValueError("当前状态无法执行此操作。")
@@ -480,7 +519,7 @@ class CoReading:
             if state.position not in state.seen:
                 state = replace(state, seen=(*state.seen, state.position))
                 await self._update(state, visible_change=False)
-            if not state.auto_advance:
+            if not state.auto_advance or not self._recent_audience_activity(adapter):
                 return
             if min(idle_seconds, monotonic() - rendered_at) < state.interaction_seconds:
                 return
@@ -491,7 +530,7 @@ class CoReading:
                 await self._update(replace(state, phase="faulted", error=output_status))
                 return
             if state.comment_status == "pending":
-                await self._schedule_comment(state)
+                await self._schedule_comment(state, automatic=True)
             elif (
                 state.comment_status in {"played", "silent"}
                 and monotonic() - rendered_at >= state.hold_seconds
@@ -501,7 +540,9 @@ class CoReading:
                 else:
                     await self._update(replace(state, phase="finished"))
 
-    async def _schedule_comment(self, state: ReadingSession) -> None:
+    async def _schedule_comment(
+        self, state: ReadingSession, *, automatic: bool
+    ) -> None:
         previous = state
         preceding_positions = tuple(
             sorted(i for i in state.seen if i < state.position)[-3:]
@@ -516,26 +557,49 @@ class CoReading:
         )
         await self._update(state)
         self._comment_task = asyncio.create_task(
-            self._comment(state, previous),
+            self._comment(state, previous, automatic=automatic),
             name="ag99live-reading-comment",
+        )
+
+    def _can_present_comment(
+        self, state: ReadingSession, adapter, *, automatic: bool
+    ) -> bool:
+        current = self.session
+        if (
+            self._disposed
+            or current is None
+            or current.session_id != state.session_id
+            or current.visit_id != state.visit_id
+            or current.phase != "running"
+            or current.pending_position is not None
+            or adapter.presentation_target != state.target
+            or self._rendered_at(current) is None
+        ):
+            return False
+        listener = self.plugin._bilibili_runtime
+        if listener is not None and listener.has_pending_input:
+            return False
+        return not automatic or (
+            current.auto_advance
+            and self._recent_audience_activity(adapter)
+            and self.plugin._topic_idle_seconds(adapter) >= current.interaction_seconds
         )
 
     async def _comment(
         self,
         state: ReadingSession,
         previous: ReadingSession,
+        *,
+        automatic: bool,
     ) -> None:
         final = None
         try:
             adapter = self._adapter(state.target.split(":", 1)[0])
-            legacy_listener = self.plugin._bilibili_runtime
-            if (
-                self.session is not None
-                and self.session.phase == "running"
-                and adapter.presentation_target == state.target
-                and self._rendered_at(state) is not None
-                and (legacy_listener is None or not legacy_listener.has_pending_input)
-            ):
+
+            def can_present() -> bool:
+                return self._can_present_comment(state, adapter, automatic=automatic)
+
+            if can_present():
                 final = await adapter.submit_reading_commentary(
                     owner=self.plugin,
                     request_id=state.turn_id,
@@ -544,6 +608,8 @@ class CoReading:
                     preceding="\n\n".join(
                         state.passages[i] for i in state.preceding_positions
                     ),
+                    automatic=automatic,
+                    can_present=can_present,
                 )
             status = final.status if final is not None else "busy"
             reason = final.reason if final is not None else None

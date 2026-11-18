@@ -78,7 +78,7 @@ class AG99liveStreamInputPlatform(Platform):
         self._runtime: BilibiliLiveRuntime | None = None
         self._turn_in_progress = False
         self._seen_viewers: set[str] = set()
-        self.last_viewer_activity_at = time.monotonic()
+        self.last_viewer_activity_at = 0.0
         self.last_turn_finished_at = 0.0
 
     def meta(self) -> PlatformMetadata:
@@ -145,10 +145,14 @@ class AG99liveStreamInputPlatform(Platform):
         )
 
     def viewer_idle_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self.latest_viewer_activity_at)
+
+    @property
+    def latest_viewer_activity_at(self) -> float:
         last = self.last_viewer_activity_at
         if self._runtime is not None:
             last = max(last, self._runtime.last_received_at)
-        return max(0.0, time.monotonic() - last)
+        return last
 
     @property
     def presentation_target(self) -> str:
@@ -167,22 +171,33 @@ class AG99liveStreamInputPlatform(Platform):
 
     async def submit_reading_commentary(
         self, *, owner, request_id: str, title: str, text: str, preceding: str,
+        automatic: bool, can_present: Callable[[], bool],
     ):
         submit = getattr(_plugin_context, "submit_plugin_commentary", None)
         if not callable(submit):
             raise RuntimeError("personal_expression_unavailable")
         if self.reading_output_status() != "ready":
             return None
-        self._turn_in_progress = True
+        claimed = False
+
+        def claim_output() -> bool:
+            nonlocal claimed
+            if self.reading_output_status() != "ready" or not can_present():
+                return False
+            self._turn_in_progress = claimed = True
+            return True
+
         try:
             return await submit(
                 owner=owner, source_platform_id=self.platform_id,
                 target_session=self.presentation_target, request_id=request_id,
                 title=title, text=text, preceding=preceding,
+                automatic=automatic, claim_output=claim_output,
             )
         finally:
-            self.last_turn_finished_at = time.monotonic()
-            self._turn_in_progress = False
+            if claimed:
+                self.last_turn_finished_at = time.monotonic()
+                self._turn_in_progress = False
 
     async def _record_viewer(self, name: str, uid: str) -> bool:
         self.last_viewer_activity_at = time.monotonic()

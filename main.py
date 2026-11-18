@@ -285,14 +285,7 @@ class AG99liveStreamHostPlugin(Star):
                 adapter = self._stream_input_adapter()
                 if adapter is None:
                     continue
-                now = time.monotonic()
-                idle_seconds = min(
-                    now - self._last_activity_at,
-                    adapter.viewer_idle_seconds(),
-                    now - adapter.last_turn_finished_at,
-                )
-                if self._bilibili_runtime is not None:
-                    idle_seconds = min(idle_seconds, now - self._bilibili_runtime.last_received_at)
+                idle_seconds = self._topic_idle_seconds(adapter)
                 if reading is not None:
                     if self._bilibili_runtime is None or not self._bilibili_runtime.has_pending_input:
                         await reading.tick(adapter, idle_seconds)
@@ -324,6 +317,17 @@ class AG99liveStreamHostPlugin(Star):
                 raise
             except Exception:
                 logger.exception("Live proactive opportunity submission failed")
+
+    def _topic_idle_seconds(self, adapter: Any) -> float:
+        now = time.monotonic()
+        idle = min(
+            now - self._last_activity_at,
+            adapter.viewer_idle_seconds(),
+            now - adapter.last_turn_finished_at,
+        )
+        if self._bilibili_runtime is not None:
+            idle = min(idle, now - self._bilibili_runtime.last_received_at)
+        return idle
 
     def _schedule_mode(self) -> str:
         mode = str(self.config.get("proactive_mode", "daily"))
