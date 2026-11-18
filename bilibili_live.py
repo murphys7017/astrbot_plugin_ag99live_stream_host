@@ -7,9 +7,10 @@ import http.cookies
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from hashlib import blake2s
 from math import log2
 from random import random, sample
-from typing import Awaitable, Callable, Mapping
+from typing import Awaitable, Callable, Literal, Mapping
 from uuid import uuid4
 
 from astrbot.api import logger
@@ -25,10 +26,9 @@ except ImportError:  # pragma: no cover - exercised by the optional dependency c
 
 
 TargetResolver = Callable[[], tuple[str, ...]]
-# False means admission was busy and no event was committed.
-ObservationSubmitter = Callable[[str, Mapping[str, object]], Awaitable[bool]]
 ViewerRecorder = Callable[[str, str], Awaitable[bool]]
-_GIFT_MAX_AGE_SECONDS = 300
+_PRIORITY_KINDS = frozenset({"live_gift", "live_advanced_chat"})
+_PRIORITY_MAX_AGE_SECONDS = 300
 _BUSY_RECHECK_SECONDS = 0.25
 _CONTRIBUTOR_LIMIT = 4096
 
@@ -42,6 +42,18 @@ class LiveInput:
     received_at: float = field(default_factory=time.time)
     received_monotonic: float = field(default_factory=time.monotonic)
     fan_level: int = 0
+    sent_at: float | None = None
+    event_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class LiveTurnResult:
+    status: Literal["not_admitted", "played", "failed", "unknown"]
+    reason: str | None = None
+
+
+ObservationSubmitter = Callable[[str, Mapping[str, object]], Awaitable[LiveTurnResult]]
+FeedbackRecorder = Callable[[int, LiveInput], bool]
 
 
 class BilibiliLiveRuntime:
@@ -58,6 +70,7 @@ class BilibiliLiveRuntime:
         submit_observation: ObservationSubmitter,
         record_viewer: ViewerRecorder,
         can_accept_input: Callable[[], bool] = lambda: True,
+        record_feedback: FeedbackRecorder | None = None,
     ) -> None:
         self.room_id = int(room_id)
         self.cookie = cookie.strip()
@@ -70,6 +83,9 @@ class BilibiliLiveRuntime:
         self._submit_observation = submit_observation
         self._record_viewer = record_viewer
         self._can_accept_input = can_accept_input
+        self._record_feedback = record_feedback
+        self._selection_key = uuid4().bytes
+        self._selection_streak: dict[str, int] = {}
         self._processing = False
         self._dropped_while_busy = 0
         self._session: aiohttp.ClientSession | None = None
@@ -118,22 +134,38 @@ class BilibiliLiveRuntime:
         session, self._session = self._session, None
         if session is not None and not session.closed:
             await session.close()
+        pending_ids = tuple(item.event_id for item in self._pending if item.event_id)
+        if pending_ids:
+            self._log_priority("cancelled", pending_ids, reason="listener_stopped")
         self._pending.clear()
         self._input_ready.clear()
         self._contributions.clear()
+        self._selection_streak.clear()
 
     def enqueue_danmaku(
-        self, name: str, uid: int, text: str, *, fan_level: int = 0
+        self,
+        name: str,
+        uid: int,
+        text: str,
+        *,
+        fan_level: int = 0,
+        timestamp_ms: int = 0,
     ) -> None:
-        self._enqueue(
-            LiveInput(
-                kind="live_danmaku",
-                name=_clean_text(name, 80) or "观众",
-                uid=str(uid or "").strip(),
-                text=_clean_text(text, 220),
-                fan_level=fan_level,
-            )
+        if self._closed:
+            return
+        item = LiveInput(
+            kind="live_danmaku",
+            name=_clean_text(name, 80) or "观众",
+            uid=str(uid or "").strip(),
+            text=_clean_text(text, 220),
+            fan_level=fan_level,
+            sent_at=timestamp_ms / 1000 if timestamp_ms and timestamp_ms > 0 else None,
         )
+        if item.text in {"+", "-"} and self._record_feedback is not None:
+            if self._record_feedback(self.room_id, item):
+                self.last_received_at = item.received_monotonic
+                return
+        self._enqueue(item)
 
     def enqueue_enter(self, name: str, uid: int) -> None:
         self._enqueue(
@@ -154,6 +186,7 @@ class BilibiliLiveRuntime:
                 name=_clean_text(name, 80) or "观众",
                 uid=str(uid or "").strip(),
                 text=_clean_text(text, 220),
+                event_id=uuid4().hex,
             )
         )
 
@@ -167,6 +200,7 @@ class BilibiliLiveRuntime:
                 name=_clean_text(name, 80) or "观众",
                 uid=str(uid or "").strip(),
                 text=_clean_text(text, 220),
+                event_id=uuid4().hex,
             )
         )
 
@@ -183,26 +217,29 @@ class BilibiliLiveRuntime:
         if self._closed or (item.kind != "live_viewer_entered" and not item.text):
             return
         self.last_received_at = time.monotonic()
-        gift = item.kind == "live_gift"
-        if not gift and (self._processing or not self._can_accept_input()):
+        priority = item.kind in _PRIORITY_KINDS
+        if not priority and (self._processing or not self._can_accept_input()):
             self._dropped_while_busy += 1
             return
         if len(self._pending) >= self._queue_limit:
             expendable = next(
-                (pending for pending in self._pending if pending.kind != "live_gift"),
+                (
+                    pending
+                    for pending in self._pending
+                    if pending.kind not in _PRIORITY_KINDS
+                ),
                 None,
             )
             if expendable is not None:
                 self._pending.remove(expendable)
-            elif not gift:
+            elif not priority:
                 return
             else:
-                self._pending.popleft()
-                logger.warning(
-                    "AG99live Bilibili gift queue is full; oldest gift dropped room=%s",
-                    self.room_id,
-                )
+                evicted = self._pending.popleft()
+                self._log_priority("overflow", (evicted.event_id,))
         self._pending.append(item)
+        if priority:
+            self._log_priority("queued", (item.event_id,), kind=item.kind)
         self._input_ready.set()
         logger.debug(
             "DIAG live_input.received room=%s kind=%s received_at=%.3f queue_size=%s",
@@ -215,36 +252,42 @@ class BilibiliLiveRuntime:
     async def _flush_loop(self) -> None:
         while True:
             await self._input_ready.wait()
-            self._discard_expired_gifts()
+            self._discard_expired_priority()
             if not self._can_accept_input():
                 # External playback has no receipt owned by this runtime. Only
-                # pending gifts need to check when that playback becomes idle.
+                # priority events need to check when that playback becomes idle.
+                previous_size = len(self._pending)
                 self._pending = deque(
-                    item for item in self._pending if item.kind == "live_gift"
+                    item for item in self._pending if item.kind in _PRIORITY_KINDS
                 )
+                self._dropped_while_busy += previous_size - len(self._pending)
                 if self._pending:
                     await asyncio.sleep(_BUSY_RECHECK_SECONDS)
                     continue
             if not self._pending:
                 self._input_ready.clear()
                 continue
-            batch = self._select_batch(list(self._pending))
-            selected_gifts = {id(item) for item in batch if item.kind == "live_gift"}
+            batch, chat_candidates, chat_routes = self._select_batch(
+                list(self._pending)
+            )
+            selected_priority = {item.event_id for item in batch if item.event_id}
             self._pending = deque(
                 item
                 for item in self._pending
-                if item.kind == "live_gift" and id(item) not in selected_gifts
+                if item.kind in _PRIORITY_KINDS
+                and item.event_id not in selected_priority
             )
             self._processing = True
             try:
-                if not await self._flush_batch(batch):
-                    # Admission may become busy while recording viewers. No
-                    # committed event is replayed, and ordinary chat stays dropped.
-                    retry = [item for item in batch if item.kind == "live_gift"]
+                if not await self._flush_batch(batch, chat_candidates, chat_routes):
+                    # Only an explicit non-admission can be retried.
+                    retry = [item for item in batch if item.kind in _PRIORITY_KINDS]
+                    self._dropped_while_busy += len(batch) - len(retry)
                     if retry:
                         self._pending.extendleft(reversed(retry))
                         while len(self._pending) > self._queue_limit:
-                            self._pending.popleft()
+                            evicted = self._pending.popleft()
+                            self._log_priority("overflow", (evicted.event_id,))
                         await asyncio.sleep(_BUSY_RECHECK_SECONDS)
             finally:
                 logger.info(
@@ -255,22 +298,26 @@ class BilibiliLiveRuntime:
                 self._dropped_while_busy = 0
                 self._processing = False
 
-    def _discard_expired_gifts(self) -> None:
-        oldest = time.monotonic() - _GIFT_MAX_AGE_SECONDS
-        self._pending = deque(
-            item
-            for item in self._pending
-            if item.kind != "live_gift" or item.received_monotonic >= oldest
-        )
+    def _discard_expired_priority(self) -> None:
+        oldest = time.monotonic() - _PRIORITY_MAX_AGE_SECONDS
+        remaining = deque()
+        expired = []
+        for item in self._pending:
+            if item.kind in _PRIORITY_KINDS and item.received_monotonic < oldest:
+                expired.append(item.event_id)
+            else:
+                remaining.append(item)
+        self._pending = remaining
+        if expired:
+            self._log_priority("expired", tuple(expired))
 
-    def _select_batch(self, burst: list[LiveInput]) -> list[LiveInput]:
+    def _select_batch(
+        self, burst: list[LiveInput]
+    ) -> tuple[list[LiveInput], int, list[tuple[LiveInput, str]]]:
         gifts = [item for item in burst if item.kind == "live_gift"]
         advanced = [item for item in burst if item.kind == "live_advanced_chat"]
         selected = (gifts + advanced)[: self.max_batch_size]
         slots = self.max_batch_size - len(selected)
-        if not slots:
-            return selected
-
         # One ordinary candidate per viewer prevents repeated posts filling a batch.
         chats = {
             item.uid or f"name:{item.name.casefold()}": item
@@ -278,12 +325,19 @@ class BilibiliLiveRuntime:
             if item.kind == "live_danmaku"
         }
         candidates = list(chats.values())
+        if not slots:
+            return selected, len(candidates), []
         if len(candidates) > slots:
             random_slots = max(1, slots // 4) if slots > 1 else int(random() < 0.25)
             candidates.sort(key=self._chat_priority, reverse=True)
             ranked = slots - random_slots
-            candidates = candidates[:ranked] + sample(candidates[ranked:], random_slots)
-        selected.extend(candidates)
+            chat_routes = [(item, "ranked") for item in candidates[:ranked]]
+            chat_routes.extend(
+                (item, "random") for item in sample(candidates[ranked:], random_slots)
+            )
+        else:
+            chat_routes = [(item, "all") for item in candidates]
+        selected.extend(item for item, _ in chat_routes)
         remaining = self.max_batch_size - len(selected)
         if remaining:
             selected.extend(
@@ -291,7 +345,50 @@ class BilibiliLiveRuntime:
                     :remaining
                 ]
             )
-        return selected
+        return selected, len(candidates), chat_routes
+
+    def _log_chat_selection(
+        self, batch_id: str, candidates: int, routes: list[tuple[LiveInput, str]]
+    ) -> None:
+        streak = {}
+        selections = []
+        for item, route in routes:
+            viewer = item.uid or f"name:{item.name.casefold()}"
+            key = blake2s(
+                viewer.encode(), key=self._selection_key, digest_size=8
+            ).hexdigest()
+            streak[key] = self._selection_streak.get(key, 0) + 1
+            selections.append((key, route, streak[key]))
+        self._selection_streak = streak
+        if candidates:
+            logger.info(
+                "DIAG live_input.chat_selection batch_id=%s candidates=%s "
+                "ranked=%s random=%s selected=%s",
+                batch_id,
+                candidates,
+                sum(route == "ranked" for _, route in routes),
+                sum(route == "random" for _, route in routes),
+                selections,
+            )
+
+    def _log_priority(
+        self,
+        state: str,
+        event_ids: tuple[str, ...],
+        *,
+        batch_id: str = "",
+        kind: str = "",
+        reason: str | None = None,
+    ) -> None:
+        logger.info(
+            "DIAG live_input.priority room=%s state=%s kind=%s event_ids=%s batch_id=%s reason=%s",
+            self.room_id,
+            state,
+            kind,
+            event_ids,
+            batch_id,
+            reason,
+        )
 
     def _chat_priority(self, item: LiveInput) -> float:
         paid_coins = self._contributions.get(item.uid, 0)
@@ -306,7 +403,12 @@ class BilibiliLiveRuntime:
     def has_pending_input(self) -> bool:
         return self._processing or bool(self._pending)
 
-    async def _flush_batch(self, batch: list[LiveInput]) -> bool:
+    async def _flush_batch(
+        self,
+        batch: list[LiveInput],
+        chat_candidates: int,
+        chat_routes: list[tuple[LiveInput, str]],
+    ) -> bool:
         batch_id = uuid4().hex
         started_at = time.monotonic()
         oldest_received = min(item.received_monotonic for item in batch)
@@ -340,6 +442,7 @@ class BilibiliLiveRuntime:
             return True
         viewers = list(participants)[:16]
         newcomers = list(new_viewers)[:16]
+        priority_ids = tuple(item.event_id for item in batch if item.event_id)
         payload = {
             "batch_id": batch_id,
             "live_input_received_at": min(item.received_at for item in batch),
@@ -351,6 +454,7 @@ class BilibiliLiveRuntime:
             "message_count": len(batch),
             "trigger": "bilibili_live",
             "event_kinds": tuple(sorted(kinds)),
+            "priority_event_ids": priority_ids,
         }
         if "live_gift" in kinds:
             kind = "live_gift"
@@ -371,21 +475,28 @@ class BilibiliLiveRuntime:
             (time.monotonic() - started_at) * 1000,
             len(self._pending),
         )
-        retry = False
         for session in self._target_resolver():
             submit_started = time.monotonic()
             try:
-                submitted = await self._submit_observation(
+                result = await self._submit_observation(
                     session, {"kind": kind, "payload": payload}
                 )
-                if not submitted:
-                    retry = True
+                if result.status == "not_admitted":
                     continue
+                self._log_chat_selection(batch_id, chat_candidates, chat_routes)
+                if priority_ids:
+                    self._log_priority(
+                        result.status,
+                        priority_ids,
+                        batch_id=batch_id,
+                        reason=result.reason,
+                    )
                 logger.info(
                     "DIAG live_input.turn_finished batch_id=%s session=%s "
-                    "turn_ms=%.1f total_ms=%.1f",
+                    "status=%s turn_ms=%.1f total_ms=%.1f",
                     batch_id,
                     session,
+                    result.status,
                     (time.monotonic() - submit_started) * 1000,
                     (time.monotonic() - oldest_received) * 1000,
                 )
@@ -393,6 +504,13 @@ class BilibiliLiveRuntime:
                 # provide multiple candidates for the same presentation target.
                 return True
             except asyncio.CancelledError:
+                if priority_ids:
+                    self._log_priority(
+                        "unknown",
+                        priority_ids,
+                        batch_id=batch_id,
+                        reason="listener_stopped",
+                    )
                 raise
             except Exception as exc:  # noqa: BLE001
                 # The output may already have started. Do not risk a double thank-you.
@@ -401,8 +519,15 @@ class BilibiliLiveRuntime:
                     session,
                     exc,
                 )
+                if priority_ids:
+                    self._log_priority(
+                        "unknown",
+                        priority_ids,
+                        batch_id=batch_id,
+                        reason=type(exc).__name__,
+                    )
                 return True
-        return not retry
+        return False
 
 
 if blivedm is not None:
@@ -422,6 +547,7 @@ if blivedm is not None:
                 message.uid,
                 message.msg,
                 fan_level=fan_level,
+                timestamp_ms=message.timestamp,
             )
 
         def _on_interact_word_v2(self, client, message) -> None:

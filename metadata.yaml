@@ -3,7 +3,7 @@ display_name: AG99live Stream Host
 desc: 独立的 AG99live 直播主持插件：主动发起话题、直连 B 站弹幕并欢迎新观众。
 version: 0.2.0
 author: AG99
-repo: https://github.com/murphys7017/AG99live
+repo: https://github.com/murphys7017/astrbot_plugin_ag99live_stream_host
 astrbot_version: ">=4.29.0-beta.1"
 support_platforms:
   - olv_pet_adapter

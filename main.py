@@ -16,7 +16,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
-from .bilibili_live import BilibiliLiveRuntime
+from .bilibili_live import BilibiliLiveRuntime, LiveInput, LiveTurnResult
 from .co_reading import CoReading, ReadingViewerContext
 from .stream_platform import set_stream_platform_context
 
@@ -64,6 +64,8 @@ class AG99liveStreamHostPlugin(Star):
         self._bilibili_runtime: BilibiliLiveRuntime | None = None
         self._state_lock = asyncio.Lock()
         self._feedback_lock = asyncio.Lock()
+        self._feedback_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=2048)
+        self._feedback_task: asyncio.Task[None] | None = None
         self._seen_viewers: dict[str, float] = {}
         self._state_path = (
             StarTools.get_data_dir("astrbot_plugin_ag99live_stream_host")
@@ -81,7 +83,14 @@ class AG99liveStreamHostPlugin(Star):
             return
         self.reading = CoReading(self, self._state_path.parent / "co-reading")
         await self.reading.load()
-        set_stream_platform_context(self.context, self._remember_viewer, self.reading.passage_for_viewer)
+        if self.config.get("motion_feedback_enabled", True):
+            self._feedback_task = asyncio.create_task(
+                self._flush_live_feedback(), name="ag99live-motion-feedback"
+            )
+        set_stream_platform_context(
+            self.context, self._remember_viewer, self.reading.passage_for_viewer,
+            self._queue_bilibili_feedback,
+        )
         self.context.register_prompt_extension_collector(ReadingViewerContext())
         self._sensor = self.context.register_runtime_observation_sensor(
             _LiveHostSensor()
@@ -102,6 +111,9 @@ class AG99liveStreamHostPlugin(Star):
                     submit_observation=self._submit_live_message,
                     record_viewer=self._remember_viewer,
                     can_accept_input=self._can_accept_live_input,
+                    record_feedback=lambda room_id, item: self._queue_bilibili_feedback(
+                        room_id, item, self._presentation_target()
+                    ),
                 )
                 await self._bilibili_runtime.start()
             except Exception:
@@ -121,6 +133,10 @@ class AG99liveStreamHostPlugin(Star):
         bilibili, self._bilibili_runtime = self._bilibili_runtime, None
         if bilibili is not None:
             await bilibili.stop()
+        feedback_task, self._feedback_task = self._feedback_task, None
+        if feedback_task is not None:
+            await self._feedback_queue.put(None)
+            await feedback_task
         await self._persist_viewer_state()
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=1000)
@@ -251,13 +267,60 @@ class AG99liveStreamHostPlugin(Star):
             "session": session,
             "source": "user_single_symbol",
         }
-        async with self._feedback_lock:
-            await asyncio.to_thread(self._append_feedback, record)
+        await self._write_feedback_records([record])
 
-    def _append_feedback(self, record: Mapping[str, Any]) -> None:
+    def _queue_bilibili_feedback(
+        self, room_id: int, item: LiveInput, session: str | None
+    ) -> bool:
+        if self._feedback_task is None:
+            return False
+        record = {
+            "schema": "ag99live.motion_feedback.v1",
+            "feedback_id": uuid4().hex,
+            "symbol": item.text,
+            "value": 1 if item.text == "+" else -1,
+            "sent_at": item.sent_at,
+            "received_at": item.received_at,
+            "session": session,
+            "source": "bilibili_danmaku",
+            "room_id": room_id,
+            "viewer_id": item.uid or None,
+        }
+        try:
+            self._feedback_queue.put_nowait(record)
+        except asyncio.QueueFull:
+            logger.warning("Bilibili motion feedback queue full room=%s", room_id)
+        return True
+
+    async def _flush_live_feedback(self) -> None:
+        while (first := await self._feedback_queue.get()) is not None:
+            batch = [first]
+            stopping = False
+            while len(batch) < 64 and not self._feedback_queue.empty():
+                record = self._feedback_queue.get_nowait()
+                if record is None:
+                    stopping = True
+                    break
+                batch.append(record)
+            try:
+                await self._write_feedback_records(batch)
+            except OSError:
+                logger.exception("Failed to write Bilibili motion feedback count=%s", len(batch))
+            if stopping:
+                return
+
+    async def _write_feedback_records(self, records: list[dict[str, Any]]) -> None:
+        async with self._feedback_lock:
+            await asyncio.to_thread(self._append_feedback, records)
+
+    def _append_feedback(self, records: list[dict[str, Any]]) -> None:
         self._feedback_path.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
         with self._feedback_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.writelines(
+                json.dumps({"recorded_at": now, **record}, ensure_ascii=False) + "\n"
+                for record in records
+            )
 
     async def reading_command(self, platform_id: str, payload: dict) -> dict:
         if self.reading is None:
@@ -385,7 +448,7 @@ class AG99liveStreamHostPlugin(Star):
 
     async def _submit_live_message(
         self, session: str, item: Mapping[str, object]
-    ) -> bool:
+    ) -> LiveTurnResult:
         if not session:
             raise ValueError("live_input_target_required")
         platform = self._stream_input_adapter()

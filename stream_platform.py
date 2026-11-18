@@ -20,7 +20,7 @@ from astrbot.api.platform import (
     register_platform_adapter,
 )
 
-from .bilibili_live import BilibiliLiveRuntime
+from .bilibili_live import BilibiliLiveRuntime, LiveInput, LiveTurnResult
 
 _PLATFORM_TYPE = "ag99live_stream_input"
 _PRESENTATION_PLATFORM_NAME = "olv_pet_adapter"
@@ -29,17 +29,20 @@ _PROTOCOL_VERSION = "v2"
 _plugin_context: Any | None = None
 _viewer_recorder: Callable[[str, str], Awaitable[bool]] | None = None
 _reading_passage: Callable[[str], str] | None = None
+_feedback_recorder: Callable[[int, LiveInput, str | None], bool] | None = None
 
 
 def set_stream_platform_context(
     context: Any,
     viewer_recorder: Callable[[str, str], Awaitable[bool]] | None = None,
     reading_passage: Callable[[str], str] | None = None,
+    feedback_recorder: Callable[[int, LiveInput, str | None], bool] | None = None,
 ) -> None:
-    global _plugin_context, _viewer_recorder, _reading_passage
+    global _plugin_context, _viewer_recorder, _reading_passage, _feedback_recorder
     _plugin_context = context
     _viewer_recorder = viewer_recorder
     _reading_passage = reading_passage
+    _feedback_recorder = feedback_recorder
 
 
 @register_platform_adapter(
@@ -108,6 +111,7 @@ class AG99liveStreamInputPlatform(Platform):
             submit_observation=self._commit_live_message,
             record_viewer=self._record_viewer,
             can_accept_input=lambda: not self.is_busy(),
+            record_feedback=self._record_bilibili_feedback,
         )
         await self._runtime.start()
         try:
@@ -128,12 +132,12 @@ class AG99liveStreamInputPlatform(Platform):
         del session, message_chain
         logger.debug("AG99live Stream Input is input-only; output uses OLV.")
 
-    async def submit_live_item(self, item: Mapping[str, object]) -> bool:
+    async def submit_live_item(self, item: Mapping[str, object]) -> LiveTurnResult:
         """Commit a plugin-generated live event through this input adapter."""
         if item.get("kind") == "live_topic":
             raise ValueError("live_topic must use the Runtime Observation sensor")
         if self._runtime is not None and self._runtime.is_processing:
-            return False
+            return LiveTurnResult("not_admitted", "stream_input_busy")
         return await self._commit_live_message(self.presentation_session_id, item)
 
     def is_busy(self) -> bool:
@@ -211,7 +215,7 @@ class AG99liveStreamInputPlatform(Platform):
 
     async def _commit_live_message(
         self, _session: str, item: Mapping[str, object]
-    ) -> bool:
+    ) -> LiveTurnResult:
         payload = item.get("payload")
         if not isinstance(payload, Mapping):
             raise ValueError("live_input_payload_required")
@@ -222,7 +226,7 @@ class AG99liveStreamInputPlatform(Platform):
         if kind != "live_topic":
             self.last_viewer_activity_at = time.monotonic()
         if self.is_busy():
-            return False
+            return LiveTurnResult("not_admitted", "presentation_unavailable")
         event_text = _format_live_message(kind, payload)
         message_id = str(payload.get("batch_id") or uuid4().hex)
         message = AstrBotMessage()
@@ -279,10 +283,13 @@ class AG99liveStreamInputPlatform(Platform):
                 },
                 commit_event=self.commit_event,
             )
+            if delivery_turn_id is None:
+                return LiveTurnResult("not_admitted", "presentation_reservation_rejected")
             logger.info(
-                "DIAG live_input.submitted core_turn_id=%s delivery_turn_id=%s",
+                "DIAG live_input.submitted core_turn_id=%s delivery_turn_id=%s priority_event_ids=%s",
                 message_id,
                 delivery_turn_id,
+                payload.get("priority_event_ids", ()),
             )
             success, reason = await olv_adapter.turn_coordinator.wait_for_turn_finished(
                 turn_id=delivery_turn_id,
@@ -294,8 +301,18 @@ class AG99liveStreamInputPlatform(Platform):
                 success,
                 reason,
             )
-            return True
-        except (TimeoutError, asyncio.CancelledError):
+            if reason and reason.startswith("turn_finished_send_failed:"):
+                return LiveTurnResult("unknown", reason)
+            return LiveTurnResult("played" if success else "failed", reason)
+        except TimeoutError:
+            if delivery_turn_id is None:
+                raise
+            await olv_adapter.turn_coordinator.abort_turn_from_backend(
+                turn_id=delivery_turn_id,
+                reason="stream_input_wait_aborted",
+            )
+            return LiveTurnResult("unknown", "playback_receipt_timeout")
+        except asyncio.CancelledError:
             if delivery_turn_id:
                 await olv_adapter.turn_coordinator.abort_turn_from_backend(
                     turn_id=delivery_turn_id,
@@ -303,8 +320,14 @@ class AG99liveStreamInputPlatform(Platform):
                 )
             raise
         finally:
-            self.last_turn_finished_at = time.monotonic()
+            if delivery_turn_id is not None:
+                self.last_turn_finished_at = time.monotonic()
             self._turn_in_progress = False
+
+
+    def _record_bilibili_feedback(self, room_id: int, item: LiveInput) -> bool:
+        recorder = _feedback_recorder
+        return recorder is not None and recorder(room_id, item, self.presentation_target)
 
 
 def _resolve_olv_adapter(platform_id: str) -> Any | None:

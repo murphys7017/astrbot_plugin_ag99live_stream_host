@@ -1,5 +1,7 @@
 # AG99live Stream Host
 
+murphys7017 为 AG99live 维护的直播主持插件，负责 B 站输入、观众反馈和共读调度。B 站连接使用配套的 blivedm 依赖修订版。 [依赖来源与构建方式](vendor/README.md) · [AG99live 桌宠](https://github.com/murphys7017/AG99live)
+
 这是一个独立的 AstrBot 插件，负责直播场景的主持逻辑和 B 站输入连接，不接管 AG99live Adapter 的 TTS 或 Live2D 动作执行。
 
 当前版本提供三件事：
@@ -7,7 +9,7 @@
 - 按间隔向 Personal Runtime 提交一次“可以自然开启话题”的机会。最终是否说话由现有 Gate、Policy、Persona 和冷却规则决定。
 - 通过 `blivedm` 直接连接 B 站 WebSocket，接收弹幕、礼物、高级留言和进入直播间事件，由 `ag99live_stream_input` 平台适配器直接提交到 AstrBot Core 事件队列；事件继续使用 OLV 的表现上下文来完成 Personal、Persona、TTS 和动作输出。
 - 持久化已见过的 B 站 UID/昵称，用于识别新观众；不会保存 Cookie 或原始弹幕历史。
-- 用户单独发送 `+` 或 `-` 时，不触发普通对话；当前只记录输入时间、评价值、来源会话和符号，写入 `motion_feedback.jsonl`，动作关联留到后续校准阶段。
+- 启用动作反馈时，单独的 `+` 或 `-` 在 B 站入口分流，生成或播放期间也会记录到 `motion_feedback.jsonl`。B 站记录包含发送时间、接收时间、房间、表现目标和可用的观众 UID。无需等待回复名额，动作关联留到后续校准。
 
 AG99live 前端不再需要连接 B 站；真实观众事件经过输入适配器和 Core pipeline。定时话题只提交结构化观察事实，由 Personal 判断是否表达，再经 Persona、TTS 和 AG99 输出；不再伪造一条观众消息。`blivedm` 使用随插件分发的依赖修订构建，来源和构建方法见 [vendor/README.md](vendor/README.md)。安装时从 AstrBot 根目录运行 `uv pip install --python .venv/Scripts/python.exe -r data/plugins/astrbot_plugin_ag99live_stream_host/requirements.txt`；不要重新安装上游 master，它的旧版 aiohttp/Brotli 约束与宿主冲突。
 
@@ -58,11 +60,13 @@ Cookie 只填写 `SESSDATA` 的值；不填写时仍可连接，但观众昵称�
 
 `presentation_session_id` 是 OLV 桌宠表现端的客户端会话 ID。平台适配器会把 B 站事件提交到 Core 全局消息队列，输出继续由 OLV Adapter 表现。
 
-空闲时收到事件立即提交，最多合并 `max_batch_size` 条已到达的事件。优先处理礼物和上舰，其次是醒目留言、普通弹幕和进场。AI 生成及桌宠播放期间，礼物和上舰会暂存，空闲后再由角色在回复开头感谢。待感谢事件与其他输入共用 `max_queue_size` 容量，礼物最多保留 5 分钟；容量用尽时优先淘汰非礼物事件。忙碌时收到的弹幕、醒目留言和进场事件直接丢弃。主动话题和礼物感谢都不会打断当前回复。
+空闲时收到事件立即提交，最多合并 `max_batch_size` 条已到达的事件。优先处理礼物和上舰，其次是醒目留言、普通弹幕和进场。AI 生成及桌宠播放期间，礼物、上舰和醒目留言共用 `max_queue_size` 的暂存容量，最多保留 5 分钟。容量用尽时先淘汰普通输入。忙碌时收到的普通弹幕和进场事件直接丢弃。AG99live 在轮次锁内检查并占用播放轮次，发现忙碌时保留优先事件等待。只有明确未入队的优先事件才会重试。
 
 普通弹幕仅在同批候选超过剩余名额时排序。每位观众保留一条候选，优先名额按本房粉丝牌等级及本次插件运行期间收到的付费礼物、醒目留言贡献综合选择，约四分之一名额从剩余观众中随机抽取。仅剩一个名额时有 25% 概率走随机，其余按优先级选择。贡献只用于选取，不查询历史榜单，重载后重新累计。缺少粉丝牌或贡献记录的观众仍可被抽中。
 
 日志 `live_input.received`、`live_input.batch_ready`、`live_input.submitted`、`live_input.playback_finished` 记录接收、排队、入队及播放结束；`batch_id` 沿用为 Core turn ID。`live_input.ready` 记录忙碌期间丢弃的数量。等待结束回执设有 300 秒故障上限，超时中止该轮次，防止断线或丢失回执导致永久忙碌；正常收到回执即恢复接收。
+
+`live_input.priority` 按优先事件 ID 记录暂存、播放成功、失败、结果不明、过期与容量淘汰。入队日志也包含这些 ID。`live_input.chat_selection` 按批次记录候选数、排序或随机命中数，以及入选观众在本次运行内的匿名标识和连续入选次数。可用这些数据评估现有权重。
 
 ## 文本共读
 
